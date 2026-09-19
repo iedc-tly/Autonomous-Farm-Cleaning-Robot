@@ -1,0 +1,163 @@
+<?xml version="1.0"?>
+<robot name="mobile_robot">
+  <!-- Materials -->
+  <material name="chassis_color">
+    <color rgba="0.12 0.16 0.23 1.0"/>
+  </material>
+  <material name="wheel_color">
+    <color rgba="0.08 0.08 0.08 1.0"/>
+  </material>
+  <material name="indicator_color">
+    <color rgba="0.96 0.62 0.04 1.0"/>
+  </material>
+  <material name="lidar_color">
+    <color rgba="0.02 0.71 0.83 1.0"/>
+  </material>
+
+  <!-- base_footprint (Ground Projection) -->
+  <link name="base_footprint"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.0515" rpy="0 0 0"/>
+  </joint>
+
+  <!-- base_link (Robot Center) -->
+  <link name="base_link">
+    <!-- Main Body Chassis -->
+    <visual>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.55 0.70 0.15"/>
+      </geometry>
+      <material name="chassis_color"/>
+    </visual>
+
+    <!-- Front Heading Direction Indicator (CORRECTED: moved to -X = actual front) -->
+    <visual>
+      <origin xyz="-0.22 0 0.155" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.12 0.08 0.01"/>
+      </geometry>
+      <material name="indicator_color"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.55 0.70 0.15"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Left-Front Wheel -->
+  <link name="lf_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="lf_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lf_wheel_link"/>
+    <origin xyz="-0.23 0.4804 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Left-Rear Wheel -->
+  <link name="lr_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="lr_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lr_wheel_link"/>
+    <origin xyz="0.23 0.4804 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Right-Front Wheel -->
+  <link name="rf_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rf_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="rf_wheel_link"/>
+    <origin xyz="-0.23 -0.4804 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Right-Rear Wheel -->
+  <link name="rr_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+      <material name="wheel_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796 0 0"/>
+      <geometry>
+        <cylinder radius="0.0515" length="0.045"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rr_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="rr_wheel_link"/>
+    <origin xyz="0.23 -0.4804 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- LiDAR RPLiDAR C1 (Rotated 180 degrees relative to model) -->
+  <link name="laser">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.04"/>
+      </geometry>
+      <material name="lidar_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.04"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="base_laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="-0.10 0.0 0.15" rpy="0 0 3.14159265359"/>
+  </joint>
+
+</robot>

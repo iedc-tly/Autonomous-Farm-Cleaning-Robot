@@ -1,0 +1,14 @@
+This XML file does not appear to have any style information associated with it. The document tree is shown below.
+<package format="3">
+<name>rover_bridge_node</name>
+<version>0.0.1</version>
+<description>WebSocket bridge speaking the Flutter app's rosbridge-style protocol (/ws/rover), publishes Twist to /cmd_vel, tracks e-stop/speed/auto-clean state, serves /health</description>
+<maintainer email="you@example.com">you</maintainer>
+<license>Apache-2.0</license>
+<depend>rclpy</depend>
+<depend>geometry_msgs</depend>
+<exec_depend>python3-flask</exec_depend>
+<export>
+<build_type>ament_python</build_type>
+</export>
+</package>
