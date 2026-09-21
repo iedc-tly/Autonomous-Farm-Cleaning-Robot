@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'rover_bridge_node'
+package_name = 'rover_app_bridge'
 
 setup(
     name=package_name,
@@ -19,7 +19,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'rover_bridge = rover_bridge_node.rover_bridge_node:main',
+            'rover_bridge = rover_app_bridge.rover_bridge_node:main',
         ],
     },
 )

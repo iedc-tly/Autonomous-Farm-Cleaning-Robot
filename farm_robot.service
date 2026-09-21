@@ -1,0 +1,15 @@
+[Unit]
+Description=Autonomous Farm Cleaner 3-Button Robot Service
+After=network.target pigpiod.service
+Wants=pigpiod.service
+
+[Service]
+Type=simple
+User=iedctly
+WorkingDirectory=/home/iedctly/ros2_ws
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && source /home/iedctly/ros2_ws/install/setup.bash && python3 /home/iedctly/ros2_ws/autostart_robot.py"
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
