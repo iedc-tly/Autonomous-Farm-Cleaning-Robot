@@ -78,11 +78,11 @@ def main():
         data = yaml.safe_load(f) or {}
 
     if 'dock' not in data:
-        data['dock'] = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        data['dock'] = {'x': -0.19, 'y': -3.041, 'yaw': 1.542}
     if 'pit' not in data:
-        data['pit'] = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        data['pit'] = {'x': 2.682, 'y': 0.237, 'yaw': -0.309}
     if 'sweep' not in data:
-        data['sweep'] = {'xmin': 0.0, 'xmax': 0.0, 'ymin': 0.0, 'ymax': 0.0, 'row_gap': 0.4, 'robot_radius': 0.3}
+        data['sweep'] = {'xmin': -3.0, 'xmax': 1.5, 'ymin': -3.0, 'ymax': 0.0, 'row_gap': 0.5, 'robot_radius': 0.48}
 
     if target == 'dock':
         data['dock'] = pose
@@ -95,11 +95,39 @@ def main():
         data['sweep']['xmax'] = pose['x']
         data['sweep']['ymax'] = pose['y']
 
+    if target in ('sweep_bl', 'sweep_tr'):
+        # Ensure xmin < xmax and ymin < ymax
+        x1, x2 = data['sweep'].get('xmin', -3.0), data['sweep'].get('xmax', 1.5)
+        y1, y2 = data['sweep'].get('ymin', -3.0), data['sweep'].get('ymax', 0.0)
+        data['sweep']['xmin'] = min(x1, x2)
+        data['sweep']['xmax'] = max(x1, x2)
+        data['sweep']['ymin'] = min(y1, y2)
+        data['sweep']['ymax'] = max(y1, y2)
+        if 'robot_radius' not in data['sweep'] or data['sweep']['robot_radius'] < 0.48:
+            data['sweep']['robot_radius'] = 0.48
+
     with open(path, 'w') as f:
         yaml.safe_dump(data, f, sort_keys=False)
 
     print(f"[set_location] Successfully updated '{target}' in {path}:")
     print(yaml.dump(data, sort_keys=False))
+
+    # Regenerate snake waypoints if sweep bounds changed
+    if target in ('sweep_bl', 'sweep_tr'):
+        try:
+            from motor_control.farm_cleaner import make_snake
+            map_yaml = "/home/iedctly/my_map.yaml"
+            sw = data['sweep']
+            wps = make_snake(map_yaml, bounds=[sw['xmin'], sw['xmax'], sw['ymin'], sw['ymax']],
+                             row_gap=sw.get('row_gap', 0.5), step_x=sw.get('row_gap', 0.5),
+                             robot_radius=sw.get('robot_radius', 0.48))
+            if wps:
+                sw_file = "/home/iedctly/ros2_ws/snake_waypoints.yaml"
+                with open(sw_file, 'w') as f:
+                    yaml.dump({'num_waypoints': len(wps), 'waypoints': wps}, f, default_flow_style=False)
+                print(f"[set_location] Generated & saved {len(wps)} safe waypoints to {sw_file}")
+        except Exception as e:
+            print(f"[set_location] Note on waypoints generation: {e}")
 
 
 if __name__ == '__main__':

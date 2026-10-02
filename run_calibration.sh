@@ -34,6 +34,7 @@ cleanup() {
         sleep 1
         pkill -9 -f "motor_node" 2>/dev/null || true
         pkill -9 -f "encoder_odom_node" 2>/dev/null || true
+        pkill -9 -f "mpu9150_node" 2>/dev/null || true
     fi
 }
 
@@ -43,10 +44,11 @@ trap cleanup SIGINT SIGTERM EXIT
 pkill -9 -f "hardware_bringup.launch.py" 2>/dev/null || true
 pkill -9 -f "motor_node" 2>/dev/null || true
 pkill -9 -f "encoder_odom_node" 2>/dev/null || true
+pkill -9 -f "mpu9150_node" 2>/dev/null || true
 sleep 1
 
-echo -e "\033[1;36m[INFO]\033[0m Starting fresh hardware drivers (motor_node & encoder_odom_node)..."
-ros2 launch motor_control hardware_bringup.launch.py > /tmp/hardware_bringup.log 2>&1 &
+echo -e "\033[1;36m[INFO]\033[0m Starting fresh hardware drivers with use_imu:=false (pure encoder odometry)..."
+ros2 launch motor_control hardware_bringup.launch.py use_imu:=false > /tmp/hardware_bringup.log 2>&1 &
 HW_PID=$!
 echo "       -> Hardware bringup started (PID: $HW_PID, log: /tmp/hardware_bringup.log)"
 sleep 3

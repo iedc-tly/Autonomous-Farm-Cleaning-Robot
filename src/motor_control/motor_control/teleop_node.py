@@ -28,8 +28,10 @@ BANNER = """
     [ Z ] : Backward + Left   [ C ] : Backward + Right
 
   Speed Adjustment:
-    [ + ] or [ = ] : Increase speed (+0.05 m/s)
-    [ - ] or [ _ ] : Decrease speed (-0.05 m/s)
+    [ + ] or [ = ] : Increase linear speed (+0.01 m/s)
+    [ - ] or [ _ ] : Decrease linear speed (-0.01 m/s)
+    [ ] ]          : Increase angular speed (+0.02 rad/s)
+    [ [ ]          : Decrease angular speed (-0.02 rad/s)
 
   Press [ Ctrl+C ] to exit safely.
 ======================================================
@@ -41,8 +43,8 @@ class SimpleTeleopNode(Node):
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # Speed settings
-        self.linear_speed = 0.2   # m/s
-        self.angular_speed = 0.3  # rad/s
+        self.linear_speed = 0.05  # m/s
+        self.angular_speed = 0.15 # rad/s
 
         self.target_linear = 0.0
         self.target_angular = 0.0
@@ -127,17 +129,19 @@ def main(args=None):
                 node.stop()
                 current_state = "STOPPED  ■"
             elif key in ('+', '='):
-                node.linear_speed = min(1.0, round(node.linear_speed + 0.05, 2))
-                node.angular_speed = min(2.0, round(node.angular_speed + 0.10, 2))
+                node.linear_speed = min(1.0, round(node.linear_speed + 0.01, 2))
             elif key in ('-', '_'):
-                node.linear_speed = max(0.05, round(node.linear_speed - 0.05, 2))
-                node.angular_speed = max(0.10, round(node.angular_speed - 0.10, 2))
+                node.linear_speed = max(0.01, round(node.linear_speed - 0.01, 2))
+            elif key in (']', '}'):
+                node.angular_speed = min(2.0, round(node.angular_speed + 0.02, 2))
+            elif key in ('[', '{'):
+                node.angular_speed = max(0.02, round(node.angular_speed - 0.02, 2))
             elif key == '\x03':                  # Ctrl+C
                 break
 
             # Print status line
             sys.stdout.write(
-                f"\r[STATUS: {current_state:<13}]  Linear: {node.target_linear:+.2f} m/s  |  Angular: {node.target_angular:+.2f} rad/s  |  Max Lin: {node.linear_speed:.2f} m/s  "
+                f"\r[STATUS: {current_state:<13}]  Lin: {node.target_linear:+.2f} (max {node.linear_speed:.2f} m/s)  |  Ang: {node.target_angular:+.2f} (max {node.angular_speed:.2f} rad/s)  "
             )
             sys.stdout.flush()
 

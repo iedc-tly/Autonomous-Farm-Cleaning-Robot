@@ -15,6 +15,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -62,6 +63,21 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ---- mpu9150_node (IMU driver) ----
+    mpu9150_node = Node(
+        package='motor_control',
+        executable='mpu9150_node',
+        name='mpu9150_node',
+        output='screen',
+        parameters=[{
+            'i2c_bus': 1,
+            'device_address': 0x68,
+            'frame_id': 'imu_link',
+            'publish_rate': 50.0,
+            'calibrate_samples': 200,
+        }],
+    )
+
     # ---- encoder_odom_node ----
     encoder_odom_node = Node(
         package='motor_control',
@@ -70,6 +86,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'invert_all': True,
+            'use_imu': True,
         }],
     )
 
@@ -99,6 +116,16 @@ def generate_launch_description():
         }.items(),
     )
 
+    # ---- Autonomous 2D Pose Identifier ----
+    auto_localize = LaunchConfiguration('auto_localize', default='false')
+    auto_localizer_node = Node(
+        package='motor_control',
+        executable='auto_global_localizer',
+        name='auto_global_localizer',
+        output='screen',
+        condition=IfCondition(auto_localize),
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_sim_time', default_value='false',
@@ -112,9 +139,15 @@ def generate_launch_description():
             'params_file', default_value=nav2_params_file,
             description='Full path to the ROS2 parameters file to use for all deployed nodes'
         ),
+        DeclareLaunchArgument(
+            'auto_localize', default_value='false',
+            description='Automatically identify and get 2D pose on launch'
+        ),
         robot_state_publisher_node,
         motor_node,
+        mpu9150_node,
         encoder_odom_node,
         rplidar_launch,
         nav2_launch,
+        auto_localizer_node,
     ])

@@ -1,0 +1,42 @@
+### EKF Configuration for Robot Localization (MPU-9150 + Wheel Encoders) ###
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.1
+    two_d_mode: true
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # Wheel Odometry source
+    odom0: /odom_raw
+    odom0_config: [
+      false, false, false,   # x, y, z position (let EKF integrate velocity)
+      false, false, false,   # roll, pitch, yaw (let IMU handle orientation)
+      true,  false, false,   # vx (linear forward velocity from encoders)
+      false, false, false,   # vy, vz
+      false, false, false    # vroll, vpitch, vyaw
+    ]
+    odom0_queue_size: 10
+    odom0_differential: false
+    odom0_relative: false
+
+    # MPU-9150 IMU source
+    imu0: /imu/data
+    imu0_config: [
+      false, false, false,   # x, y, z position
+      false, false, true,    # roll, pitch, yaw (fuse heading yaw from IMU)
+      false, false, false,   # vx, vy, vz
+      false, false, true,    # vroll, vpitch, vyaw (angular velocity z from gyro)
+      true,  false, false    # ax, ay, az (forward linear acceleration)
+    ]
+    imu0_queue_size: 10
+    imu0_differential: false
+    imu0_relative: true
+    imu0_remove_gravitational_acceleration: true

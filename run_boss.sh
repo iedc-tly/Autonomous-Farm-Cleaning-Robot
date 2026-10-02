@@ -28,8 +28,8 @@ echo -e "\033[1;34m=============================================================
 echo -e "\033[1;32m   AUTONOMOUS FARM CLEANER - BOSS ORCHESTRATOR & APP BRIDGE SERVER   \033[0m"
 echo -e "\033[1;34m====================================================================\033[0m"
 
-# 4. Launch Boss Server (runs Python node directly to bypass shell index cache issues)
-NODE_SCRIPT="$WS_DIR/install/rover_app_bridge/lib/python3.10/site-packages/rover_app_bridge/rover_bridge_node.py"
+# 4. Launch Boss Server (runs Python node directly from src)
+NODE_SCRIPT="$WS_DIR/src/rover_app_bridge/rover_app_bridge/rover_bridge_node.py"
 
 if [ -f "$NODE_SCRIPT" ]; then
     python3 "$NODE_SCRIPT"

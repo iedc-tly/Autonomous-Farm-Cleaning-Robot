@@ -15,6 +15,8 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rcl_interfaces.srv import GetParameters, SetParameters
+from rcl_interfaces.msg import Parameter, ParameterType
 
 class OdomCalibrator(Node):
     def __init__(self):
@@ -26,6 +28,39 @@ class OdomCalibrator(Node):
         self.current_y = 0.0
         self.current_yaw = 0.0
         self.has_odom = False
+
+    def get_remote_parameter(self, target_node: str, param_name: str, default_val=None):
+        client = self.create_client(GetParameters, f'{target_node}/get_parameters')
+        if not client.wait_for_service(timeout_sec=1.5):
+            return default_val
+        req = GetParameters.Request()
+        req.names.append(param_name)
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        if future.done():
+            res = future.result()
+            if res and res.values and res.values[0].type == ParameterType.PARAMETER_DOUBLE:
+                return res.values[0].double_value
+        return default_val
+
+    def set_remote_parameter(self, target_node: str, param_name: str, double_val: float) -> bool:
+        client = self.create_client(SetParameters, f'{target_node}/set_parameters')
+        if not client.wait_for_service(timeout_sec=1.5):
+            return False
+        req = SetParameters.Request()
+        p = Parameter()
+        p.name = param_name
+        p.value.type = ParameterType.PARAMETER_DOUBLE
+        p.value.double_value = float(double_val)
+        req.parameters.append(p)
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        if future.done():
+            res = future.result()
+            if res and res.results and res.results[0].successful:
+                return True
+        return False
+
 
     def _odom_cb(self, msg: Odometry):
         self.current_x = msg.pose.pose.position.x
@@ -164,9 +199,27 @@ def main(args=None):
         choice = input("Enter choice (1/2/3): ").strip()
 
     if choice == '1':
-        dist = float(input("Enter target distance in meters (e.g. 2.0): ") or "2.0")
-        current_dia = float(input("Enter current WHEEL_DIAMETER_M in code (e.g. 0.1029866): ") or "0.1029866")
-        speed = float(input("Enter linear velocity in m/s (default 0.4): ") or "0.4")
+        active_dia = calibrator.get_remote_parameter('/encoder_odom_node', 'wheel_diameter', 0.1013184)
+        if active_dia is not None:
+            print(f"\n[INFO] Current active WHEEL_DIAMETER_M in encoder_odom_node: {active_dia:.7f} m")
+        else:
+            active_dia = 0.1013184
+            print(f"\n[WARN] Could not query encoder_odom_node directly, using default: {active_dia:.7f} m")
+
+        dia_in = input(f"Enter WHEEL_DIAMETER_M to test with [press Enter to keep {active_dia:.7f}]: ").strip()
+        if dia_in:
+            try:
+                active_dia = float(dia_in)
+                success = calibrator.set_remote_parameter('/encoder_odom_node', 'wheel_diameter', active_dia)
+                if success:
+                    print(f"-> [OK] Dynamically updated encoder_odom_node wheel_diameter to {active_dia:.7f} m")
+                else:
+                    print(f"-> [WARN] Could not update live node parameter; proceeding with value for calculation.")
+            except ValueError:
+                print("Invalid number entered; keeping current value.")
+
+        dist = float(input("Enter target distance in meters (e.g. 2.0) [default 2.0]: ") or "2.0")
+        speed = float(input("Enter linear velocity in m/s [default 0.4]: ") or "0.4")
         
         odom_dist = calibrator.drive_straight(dist, speed_mps=speed)
         
@@ -174,32 +227,67 @@ def main(args=None):
             print("\n--- LINEAR CALIBRATION RESULTS ---")
             actual_dist = float(input(f"Measure and enter ACTUAL distance traveled on floor in meters (e.g. {odom_dist:.3f}): "))
             
-            new_dia = current_dia * (actual_dist / odom_dist)
+            new_dia = active_dia * (actual_dist / odom_dist)
             scale_factor = actual_dist / odom_dist
             print(f"Odom Reported Distance: {odom_dist:.4f} m")
             print(f"Actual Measured Distance: {actual_dist:.4f} m")
             print(f"Linear Scale Factor (C_x): {scale_factor:.6f}")
             print(f"-> RECOMMENDED NEW WHEEL_DIAMETER_M = {new_dia:.7f}")
+
+            apply_now = input(f"Apply new wheel_diameter ({new_dia:.7f} m) to live running node now? (y/n) [default: y]: ").strip().lower()
+            if apply_now in ('', 'y', 'yes'):
+                success = calibrator.set_remote_parameter('/encoder_odom_node', 'wheel_diameter', new_dia)
+                if success:
+                    print(f"-> [OK] Successfully applied {new_dia:.7f} m to running encoder_odom_node!")
+                else:
+                    print(f"-> [WARN] Could not set parameter on running node.")
         else:
             print("Linear test aborted or 0 distance recorded.")
 
     elif choice == '2':
-        turns = float(input("Enter number of 360-deg turns to execute (e.g. 1.0 or 3.0): ") or "1.0")
-        current_tw = float(input("Enter current TRACK_WIDTH_M in code (e.g. 0.960844): ") or "0.960844")
-        speed_radps = float(input("Enter turning velocity in rad/s (default 0.7): ") or "0.7")
+        active_tw = calibrator.get_remote_parameter('/encoder_odom_node', 'track_width', 0.8014317)
+        if active_tw is not None:
+            print(f"\n[INFO] Current active TRACK_WIDTH_M in encoder_odom_node: {active_tw:.7f} m")
+        else:
+            active_tw = 0.8014317
+            print(f"\n[WARN] Could not query encoder_odom_node directly, using default: {active_tw:.7f} m")
+
+        tw_in = input(f"Enter TRACK_WIDTH_M to test with [press Enter to keep {active_tw:.7f}]: ").strip()
+        if tw_in:
+            try:
+                active_tw = float(tw_in)
+                success = calibrator.set_remote_parameter('/encoder_odom_node', 'track_width', active_tw)
+                if success:
+                    print(f"-> [OK] Dynamically updated encoder_odom_node track_width to {active_tw:.7f} m")
+                else:
+                    print(f"-> [WARN] Could not update live node parameter; proceeding with value for calculation.")
+            except ValueError:
+                print("Invalid number entered; keeping current value.")
+
+        turns = float(input("\nEnter number of 360-deg turns to execute (e.g. 1.0 or 3.0) [default 1.0]: ") or "1.0")
+        speed_radps = float(input("Enter turning velocity in rad/s [default 0.7]: ") or "0.7")
         
         target_rad = turns * 2.0 * math.pi
         odom_rot = calibrator.rotate_in_place(target_rad, speed_radps=speed_radps)
         
         if odom_rot > 0.01:
             print("\n--- ANGULAR / TRACK WIDTH CALIBRATION RESULTS ---")
-            actual_turns = float(input(f"Enter ACTUAL number of turns completed in real life (e.g. 1.0 or 0.85): ") or str(turns))
+            actual_turns = float(input(f"Enter ACTUAL number of turns completed in real life (e.g. 1.0 or 0.75): ") or str(turns))
             actual_rad = actual_turns * 2.0 * math.pi
             
-            new_tw = current_tw * (odom_rot / actual_rad)
+            new_tw = active_tw * (odom_rot / actual_rad)
             print(f"Odom Reported Rotation: {math.degrees(odom_rot):.2f} deg ({odom_rot:.4f} rad)")
             print(f"Actual Real Rotation:   {math.degrees(actual_rad):.2f} deg ({actual_rad:.4f} rad)")
             print(f"-> RECOMMENDED NEW TRACK_WIDTH_M = {new_tw:.7f}")
+
+            apply_now = input(f"Apply new track_width ({new_tw:.7f} m) to live running node now? (y/n) [default: y]: ").strip().lower()
+            if apply_now in ('', 'y', 'yes'):
+                success = calibrator.set_remote_parameter('/encoder_odom_node', 'track_width', new_tw)
+                if success:
+                    print(f"-> [OK] Successfully applied {new_tw:.7f} m to running encoder_odom_node!")
+                    print("   You can run test 2 again immediately to verify that the robot now completes 1.0 full turn.")
+                else:
+                    print(f"-> [WARN] Could not set parameter on running node.")
         else:
             print("Rotation test aborted or 0 rotation recorded.")
 

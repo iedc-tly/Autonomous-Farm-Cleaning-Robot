@@ -31,7 +31,7 @@ from launch_ros.actions import Node
 # Lidar mount offset relative to base_link (meters) — EDIT THESE to match
 # your actual robot. "Offset forward" means positive X.
 # ---------------------------------------------------------------------------
-LIDAR_X_OFFSET = "0.10"   # forward offset, meters — MEASURE AND ADJUST
+LIDAR_X_OFFSET = "-0.10"   # forward offset, meters — MEASURE AND ADJUST
 LIDAR_Y_OFFSET = "0.0"
 LIDAR_Z_HEIGHT = "0.15"   # height above base_link, meters — MEASURE AND ADJUST
 LIDAR_ROLL = "0"

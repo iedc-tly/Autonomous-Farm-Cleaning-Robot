@@ -14,7 +14,32 @@ set -e
 # Workspace path
 WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_DISTRO_PATH="/opt/ros/humble"
-MAP_FILE="${1:-/home/iedctly/my_map.yaml}"
+
+# Parse CLI options: map file and localization mode
+MAP_FILE="/home/iedctly/my_map.yaml"
+LOC_MODE="auto"
+
+for arg in "$@"; do
+    case "$arg" in
+        --global)
+            LOC_MODE="global"
+            ;;
+        --dock)
+            LOC_MODE="dock"
+            ;;
+        --no-localize|--manual)
+            LOC_MODE="none"
+            ;;
+        *.yaml)
+            MAP_FILE="$arg"
+            ;;
+        *)
+            if [ -f "$arg" ]; then
+                MAP_FILE="$arg"
+            fi
+            ;;
+    esac
+done
 
 # Print colored header
 echo -e "\033[1;34m====================================================================\033[0m"
@@ -91,7 +116,7 @@ kill_tree
 
 
 # 2. Launch Nav2 Bringup (Motors, Encoders, RPLiDAR, Map Server, AMCL, Costmaps, Planner/Controller)
-echo -e "\033[1;36m[1/2]\033[0m Launching Nav2 Navigation stack with map: $MAP_FILE ..."
+echo -e "\033[1;36m[1/3]\033[0m Launching Nav2 Navigation stack with map: $MAP_FILE ..."
 ros2 launch motor_control nav2_bringup.launch.py map:="$MAP_FILE" > /tmp/nav2_bringup.log 2>&1 &
 NAV2_PID=$!
 PIDS+=($NAV2_PID)
@@ -101,7 +126,7 @@ echo "      -> Waiting 6 seconds for Nav2 lifecycle nodes to activate..."
 sleep 6
 
 # 3. Launch RViz2 Visualization
-echo -e "\033[1;36m[2/2]\033[0m Launching RViz2 visualization..."
+echo -e "\033[1;36m[2/3]\033[0m Launching RViz2 visualization..."
 if [ -f "$RVIZ_CONFIG" ]; then
     rviz2 -d "$RVIZ_CONFIG" > /tmp/rviz2.log 2>&1 &
 else
@@ -110,10 +135,20 @@ fi
 RVIZ_PID=$!
 PIDS+=($RVIZ_PID)
 echo "      -> RViz2 started (PID: $RVIZ_PID, log: /tmp/rviz2.log)"
+sleep 2
+
+# 4. Autonomous 2D Pose Identification
+if [ "$LOC_MODE" != "none" ]; then
+    echo -e "\n\033[1;36m[3/3]\033[0m Identifying and setting robot 2D pose autonomously (mode: $LOC_MODE)..."
+    python3 "$WS_DIR/src/motor_control/motor_control/auto_global_localizer.py" --mode "$LOC_MODE" || true
+else
+    echo -e "\n\033[1;33m[MANUAL LOCALIZATION]\033[0m Auto-localization skipped. Use '2D Pose Estimate' in RViz2."
+fi
 
 echo -e "\033[1;32m--------------------------------------------------------------------\033[0m"
-echo -e "\033[1;32m Nav2 System Running! Use '2D Pose Estimate' in RViz2 to localize,  \033[0m"
-echo -e "\033[1;32m and '2D Goal Pose' to set navigation targets. Press Ctrl+C to stop.\033[0m"
+echo -e "\033[1;32m Nav2 System Running! Robot 2D Pose Identified Autonomously.        \033[0m"
+echo -e "\033[1;32m Click '2D Goal Pose' in RViz2 to set navigation targets.           \033[0m"
+echo -e "\033[1;32m Press Ctrl+C to stop.                                              \033[0m"
 echo -e "\033[1;32m--------------------------------------------------------------------\033[0m"
 
 wait $NAV2_PID

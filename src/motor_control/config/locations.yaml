@@ -1,3 +1,15 @@
-dock: {x: 0.0, y: 0.0, yaw: 0.0}
-pit:  {x: 1.0, y: 1.0, yaw: 0.0}
-sweep: {xmin: -2.0, xmax: 2.0, ymin: -2.0, ymax: 2.0, row_gap: 0.4, robot_radius: 0.3}
+dock:
+  x: -1.431
+  y: -0.808
+  yaw: 1.551
+pit:
+  x: 4.881
+  y: -0.576
+  yaw: -0.098
+sweep:
+  xmin: -0.996
+  xmax: 4.763
+  ymin: -0.137
+  ymax: -0.063
+  row_gap: 0.5
+  robot_radius: 0.48

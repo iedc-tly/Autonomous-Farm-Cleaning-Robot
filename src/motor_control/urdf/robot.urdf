@@ -160,4 +160,20 @@
     <origin xyz="-0.10 0.0 0.15" rpy="0 0 3.14159265359"/>
   </joint>
 
+  <!-- IMU (MPU-9150) -->
+  <link name="imu_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.03 0.02 0.005"/>
+      </geometry>
+      <material name="indicator_color"/>
+    </visual>
+  </link>
+  <joint name="base_imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.0 0.0 0.08" rpy="0 0 0"/>
+  </joint>
+
 </robot>

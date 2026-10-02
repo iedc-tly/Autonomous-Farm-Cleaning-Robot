@@ -19,7 +19,8 @@ setup(
             'config/slam_toolbox_params.yaml',
             'config/nav2_params.yaml',
             'config/mapping.rviz',
-            'config/locations.yaml'
+            'config/locations.yaml',
+            'config/ekf.yaml'
         ]),
         ('share/' + package_name + '/urdf', ['urdf/robot.urdf']),
     ],
@@ -40,6 +41,12 @@ setup(
             'waypoint_recorder = motor_control.snake_pattern_navigator:record_main',
             'farm_cleaner = motor_control.farm_cleaner:main',
             'set_location = motor_control.set_location:main',
+            'auto_global_localizer = motor_control.auto_global_localizer:main',
+            'pose_corrector = motor_control.pose_corrector:main',
+            'configure_locations = motor_control.configure_locations:main',
+            'mpu9150_node = motor_control.mpu9150_node:main',
+            'test_mpu9150 = motor_control.test_mpu9150:main',
+            'set_speed = motor_control.set_speed:main',
         ],
     },
 )
