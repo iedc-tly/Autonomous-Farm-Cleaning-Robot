@@ -44,7 +44,8 @@ class S(Enum):
 def launch(cmd: str) -> subprocess.Popen:
     """Launch process in its own session group for clean kill later."""
     print(f"[BossNode] Launching process group: {cmd}")
-    return subprocess.Popen(cmd, shell=True, start_new_session=True)
+    bash_cmd = f"bash -c 'source /opt/ros/humble/setup.bash; [ -f /home/iedctly/ros2_ws/install/setup.bash ] && source /home/iedctly/ros2_ws/install/setup.bash; export ROS_LOG_DIR=/tmp; exec {cmd}'"
+    return subprocess.Popen(bash_cmd, shell=True, start_new_session=True)
 
 
 def stop(p: subprocess.Popen, timeout: float = 10.0):
@@ -389,11 +390,20 @@ class Cleaner:
             self.state = S.MAPPING
             return True
 
-    def save_map(self) -> bool:
+    def save_map(self, map_name: str = None) -> bool:
         with self.lock:
-            print("[Cleaner] Saving map and transitioning to MAP_SAVED...")
-            cmd = f"ros2 run nav2_map_server map_saver_cli -f {self.map_prefix}"
-            res = subprocess.run(cmd, shell=True)
+            if map_name:
+                self.map_prefix = map_name if map_name.startswith('/') else os.path.join("/home/iedctly", map_name)
+                self.map_yaml = f"{self.map_prefix}.yaml"
+
+            print(f"[Cleaner] Saving map to {self.map_prefix} and transitioning to MAP_SAVED...")
+            cmd = f"bash -c 'source /opt/ros/humble/setup.bash; [ -f /home/iedctly/ros2_ws/install/setup.bash ] && source /home/iedctly/ros2_ws/install/setup.bash; export ROS_LOG_DIR=/tmp; exec ros2 run nav2_map_server map_saver_cli -f {self.map_prefix} --ros-args --remap map:=/map'"
+            ret = -1
+            try:
+                res = subprocess.run(cmd, shell=True, timeout=30)
+                ret = res.returncode
+            except Exception as e:
+                print(f"[Cleaner] Exception running map_saver_cli: {e}")
 
             if self.slam:
                 stop(self.slam)
@@ -402,12 +412,12 @@ class Cleaner:
             kill_all_zombies()
             subprocess.run("rm -f *.posegraph *.data /tmp/*.posegraph /tmp/*.data", shell=True)
 
-            if res.returncode == 0 and os.path.exists(self.map_yaml):
+            if (ret == 0 and os.path.exists(self.map_yaml)) or (os.path.exists(self.map_yaml) and os.path.getmtime(self.map_yaml) > (time.time() - 35)):
                 print(f"[Cleaner] Map saved successfully: {self.map_yaml}")
                 self.state = S.MAP_SAVED
                 return True
             else:
-                print(f"[Cleaner] Map save failed!")
+                print(f"[Cleaner] Map save failed! Returncode: {ret}")
                 return False
 
     def start_sweep(self, bounds: list = None, row_gap: float = 0.4, step_x: float = 0.4, robot_radius: float = 0.48) -> bool:

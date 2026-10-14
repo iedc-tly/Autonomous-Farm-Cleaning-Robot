@@ -167,7 +167,7 @@ class PrecisionGlobalLocalizer(Node):
             return False
 
     def publish_initial_pose(self, x: float, y: float, yaw: float):
-        """Seed AMCL with initial 2D pose estimate on /initialpose."""
+        """Seed AMCL with initial 2D pose estimate on /initialpose with calibrated precision covariance."""
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -180,10 +180,10 @@ class PrecisionGlobalLocalizer(Node):
         msg.pose.pose.orientation.z = float(q['z'])
         msg.pose.pose.orientation.w = float(q['w'])
 
-        # Moderate initial covariance (0.25 m², 0.25 m², ~15° yaw)
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.068
+        # Calibrated dock covariance (0.02 m², 0.02 m², ~7° yaw)
+        msg.pose.covariance[0] = 0.02
+        msg.pose.covariance[7] = 0.02
+        msg.pose.covariance[35] = 0.015
 
         for _ in range(5):
             self.initial_pose_pub.publish(msg)
@@ -205,31 +205,94 @@ class PrecisionGlobalLocalizer(Node):
         yaw = yaw_from_quaternion(q)
         return p, q, yaw
 
-    def try_dock_localization(self, dock_pose: dict, num_updates: int = 6, target_cov: float = 0.06) -> bool:
+    def run_micro_alignment(self, angular_speed: float = 0.12, duration: float = 2.4) -> bool:
         """
-        Fast-path check: Seed AMCL with saved Dock pose and test LiDAR scan match.
-        If robot is at dock, covariance collapses to < target_cov within ~1.5 seconds.
+        Gentle in-place micro-rotation wiggle (+/- 5 degrees) to provide orthogonal
+        wall constraints to AMCL scan matching and collapse lingering covariance.
+        """
+        self.get_logger().info("\033[1;36m[PRECISION ALIGNMENT]\033[0m Executing scan-matching micro-alignment wiggle...")
+        turn_msg = Bool()
+        turn_msg.data = False
+        self.turn_mode_pub.publish(turn_msg)
+
+        twist = Twist()
+        phase_time = duration / 3.0
+
+        try:
+            # Phase 1: Small nudge left
+            twist.angular.z = float(angular_speed)
+            t_sub = time.time()
+            while (time.time() - t_sub) < phase_time and rclpy.ok():
+                self.cmd_pub.publish(twist)
+                self.call_nomotion_update(timeout_sec=0.05)
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+            # Phase 2: Counter-turn right
+            twist.angular.z = -float(angular_speed)
+            t_sub = time.time()
+            while (time.time() - t_sub) < (phase_time * 1.5) and rclpy.ok():
+                self.cmd_pub.publish(twist)
+                self.call_nomotion_update(timeout_sec=0.05)
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+            # Phase 3: Return to center
+            twist.angular.z = float(angular_speed)
+            t_sub = time.time()
+            while (time.time() - t_sub) < (phase_time * 0.5) and rclpy.ok():
+                self.cmd_pub.publish(twist)
+                self.call_nomotion_update(timeout_sec=0.05)
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+        finally:
+            self.stop_robot()
+
+        # Final stationary sharpening burst
+        for _ in range(6):
+            self.call_nomotion_update(timeout_sec=0.1)
+            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.08)
+
+        self.get_logger().info(
+            f"Micro-alignment complete. Final Covariance: X={self.cov_x:.4f}, Y={self.cov_y:.4f}, Yaw={self.cov_yaw:.4f}"
+        )
+        return self.cov_x < 0.04 and self.cov_y < 0.04 and self.cov_yaw < 0.035
+
+    def try_dock_localization(self, dock_pose: dict, num_updates: int = 15, target_cov: float = 0.045) -> bool:
+        """
+        Fast-path check & lock: Seed AMCL with saved Dock pose, burst no-motion updates
+        to align with LiDAR scans against map walls. If close but unaligned, executes micro-wiggle.
         """
         self.get_logger().info(
             f"\033[1;36m[CHECKING SAVED DOCK POSE]\033[0m Testing pose: "
             f"X={dock_pose['x']:.3f}m, Y={dock_pose['y']:.3f}m, Yaw={math.degrees(dock_pose['yaw']):.1f}°"
         )
         self.publish_initial_pose(dock_pose['x'], dock_pose['y'], dock_pose['yaw'])
-        time.sleep(0.2)
+        time.sleep(0.3)
 
         # Burst no-motion updates so AMCL evaluates laser scan against map
-        for _ in range(num_updates):
+        for i in range(num_updates):
             self.call_nomotion_update(timeout_sec=0.15)
             rclpy.spin_once(self, timeout_sec=0.1)
-            time.sleep(0.1)
+            time.sleep(0.12)
+            if self.cov_x <= target_cov and self.cov_y <= target_cov and self.cov_yaw <= 0.035:
+                # Do 2 more updates to fully lock in
+                self.call_nomotion_update(timeout_sec=0.15)
+                rclpy.spin_once(self, timeout_sec=0.1)
+                break
 
         rclpy.spin_once(self, timeout_sec=0.2)
         self.get_logger().info(
             f"Dock Verification Covariance: X={self.cov_x:.4f}, Y={self.cov_y:.4f}, Yaw={self.cov_yaw:.4f}"
         )
 
-        if self.cov_x <= target_cov and self.cov_y <= target_cov and self.cov_yaw <= 0.045:
+        if self.cov_x <= target_cov and self.cov_y <= target_cov and self.cov_yaw <= 0.035:
             return True
+
+        # If covariance is close (within dock vicinity, but needs angular excitation to snap walls)
+        if self.cov_x < 0.15 and self.cov_y < 0.15:
+            if self.run_micro_alignment():
+                return True
+
         return False
 
     def run_global_localization(self, max_duration: float = 40.0, angular_speed: float = 0.15, target_cov: float = 0.045) -> bool:
@@ -338,6 +401,18 @@ class PrecisionGlobalLocalizer(Node):
                 self.get_logger().info(
                     "\033[1;33m[DOCK MISMATCH]\033[0m Current LiDAR scan does not match dock. Robot is elsewhere on map."
                 )
+
+        # Step 1.5: If saved dock didn't match, test map origin (0, 0, 0) where mapping started
+        if mode in ('auto', 'dock'):
+            origin_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+            self.get_logger().info("\033[1;36m[TESTING MAP ORIGIN]\033[0m Testing if robot is at SLAM start origin (0, 0, 0)...")
+            if self.try_dock_localization(origin_pose):
+                p, q, yaw = self.get_current_pose_tuple()
+                self._print_success_banner("ROBOT LOCALIZED AT MAP START ORIGIN (0, 0, 0)", p.x, p.y, yaw)
+                return True, {'x': p.x, 'y': p.y, 'yaw': yaw}
+            elif mode == 'dock':
+                self.get_logger().warn("Neither dock nor map origin matched.")
+                return False, None
 
         # Step 2: Global scan-matching
         self.get_logger().info("\033[1;36m[IDENTIFYING 2D POSE]\033[0m Starting autonomous 360° global scan-matching...")

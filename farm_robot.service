@@ -1,5 +1,5 @@
 [Unit]
-Description=Autonomous Farm Cleaner 3-Button Robot Service
+Description=Autonomous Farm Cleaner Robot Boss & App Service
 After=network-online.target pigpiod.service
 Wants=network-online.target pigpiod.service
 
@@ -8,11 +8,13 @@ Type=simple
 User=iedctly
 WorkingDirectory=/home/iedctly/ros2_ws
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash /home/iedctly/ros2_ws/allrun.sh --headless
-Restart=on-failure
+Environment=ROS_LOG_DIR=/tmp
+Environment=HOME=/home/iedctly
+ExecStart=/bin/bash /home/iedctly/ros2_ws/run_boss.sh
+Restart=always
 RestartSec=5s
 KillMode=control-group
-TimeoutStopSec=20
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

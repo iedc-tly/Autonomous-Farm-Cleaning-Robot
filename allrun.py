@@ -362,12 +362,23 @@ class PipelineSupervisorNode(Node):
         msg.pose.pose.orientation.y = q['y']
         msg.pose.pose.orientation.z = q['z']
         msg.pose.pose.orientation.w = q['w']
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.06
+        msg.pose.covariance[0] = 0.02
+        msg.pose.covariance[7] = 0.02
+        msg.pose.covariance[35] = 0.015
         for _ in range(5):
             self.initial_pose_pub.publish(msg)
-            time.sleep(0.05)
+            time.sleep(0.04)
+
+        # Trigger stationary AMCL scan-matching sharpening burst
+        try:
+            from std_srvs.srv import Empty as EmptySrv
+            nomotion_client = self.create_client(EmptySrv, '/request_nomotion_update')
+            if nomotion_client.wait_for_service(timeout_sec=1.5):
+                for _ in range(8):
+                    nomotion_client.call_async(EmptySrv.Request())
+                    time.sleep(0.12)
+        except Exception:
+            pass
 
 
 def check_lifecycle_nodes(node: Node, timeout_sec: float = 25.0) -> bool:
