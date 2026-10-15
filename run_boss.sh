@@ -11,7 +11,8 @@ set -e
 WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Ensure standard environment
-export HOME="${HOME:-/home/iedctly}"
+ROBOT_HOME="${ROBOT_HOME:-${HOME:-$HOME}}"
+export HOME="${ROBOT_HOME:-~}"
 export ROS_LOG_DIR="/tmp"
 export PYTHONUNBUFFERED=1
 
@@ -38,10 +39,10 @@ if ! pgrep -x pigpiod >/dev/null 2>&1; then
     sleep 0.5
 fi
 
-# 4. Launch rosbridge_websocket (:9090) in background if not already running
+# 4. Launch rosbridge_websocket (:9090) bound to localhost (127.0.0.1) if not already running
 if ! pgrep -f "rosbridge_websocket" >/dev/null 2>&1; then
-    echo "[App Bridge] Launching rosbridge_websocket (:9090)..."
-    ros2 launch rosbridge_server rosbridge_websocket_launch.xml >/tmp/rosbridge.log 2>&1 &
+    echo "[App Bridge] Launching rosbridge_websocket (127.0.0.1:9090)..."
+    ros2 launch rosbridge_server rosbridge_websocket_launch.xml address:=127.0.0.1 >/tmp/rosbridge.log 2>&1 &
 fi
 
 # Check if an instance of rover_bridge_node is already running
@@ -56,7 +57,7 @@ echo "   AUTONOMOUS FARM CLEANER - BOSS ORCHESTRATOR & APP BRIDGE SERVER   "
 echo "===================================================================="
 echo "  • Mobile Web App  : http://0.0.0.0:8000"
 echo "  • REST / WS API   : http://0.0.0.0:8000/api"
-echo "  • Rosbridge Port  : ws://0.0.0.0:9090"
+echo "  • Rosbridge Port  : ws://127.0.0.1:9090 (localhost only)"
 echo "===================================================================="
 
 # 6. Launch Boss Server via exec so signals (SIGTERM/SIGINT) pass cleanly
