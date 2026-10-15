@@ -636,24 +636,45 @@ class BridgeNode(Node):
                 "percent": self.percent,
                 "waypoint_index": self.waypoint_index,
                 "waypoint_total": self.waypoint_total,
-                "pose": self.get_current_pose(),
+                "pose": None,
                 "nav2_active": self.is_nav2_active(),
                 "last_task": self.last_task,
                 "last_result": self.last_result,
                 "error": self.error,
                 "e_stop": self.status.get('e_stop', False)
             }
-            return st
+        st["pose"] = self.get_current_pose()
+        return st
 
     def trigger_e_stop(self):
-        """Execute complete Emergency Stop across hardware motors, Nav2 goals, and orchestrator without killing process."""
+        """Execute complete Emergency Stop across hardware motors, Nav2 goals, and orchestrator without waiting on locks."""
+        # Immediate unlatched status update
+        self.status['e_stop'] = True
+
+        # 1. Immediate publish hardware E-STOP (5x) before acquiring locks
+        try:
+            empty_msg = EmptyMsg()
+            for _ in range(5):
+                self.pub_hw_estop.publish(empty_msg)
+                time.sleep(0.005)
+        except Exception as e:
+            self.get_logger().error(f"Error publishing hardware estop: {e}")
+
+        # 2. Immediate zero velocity command override burst (3x)
+        try:
+            for _ in range(3):
+                self.publish_twist(0.0, 0.0)
+                time.sleep(0.005)
+        except Exception as e:
+            self.get_logger().error(f"Error publishing zero twist: {e}")
+
         self.get_logger().warn("\033[1;31m[EMERGENCY STOP TRIGGERED]\033[0m Halting hardware motors and cancelling all navigation tasks!")
 
+        # 3. Take lock for state bookkeeping
         with self.lock:
             was_running = (self.state != "IDLE")
             running_task = self.task
             self.cancel_requested = True
-            self.status['e_stop'] = True
             if was_running:
                 self.last_task = running_task
                 self.last_result = "canceled"
@@ -661,37 +682,20 @@ class BridgeNode(Node):
             self.state = "IDLE"
             self.task = None
 
-        # 1. Publish hardware E-STOP to /estop (motor_ros_node triggers mc.stop_all(immediate=True))
-        try:
-            empty_msg = EmptyMsg()
-            for _ in range(5):
-                self.pub_hw_estop.publish(empty_msg)
-                time.sleep(0.01)
-        except Exception as e:
-            self.get_logger().error(f"Error publishing hardware estop: {e}")
-
-        # 2. Cancel Nav2 active action goal safely
+        # 4. Cancel Nav2 active action goal safely
         if self.current_goal_handle:
             try:
                 self.current_goal_handle.cancel_goal_async()
             except Exception as e:
                 self.get_logger().error(f"Error cancelling Nav2 goal: {e}")
 
-        # 3. Cleanly cancel cleaner task if running without killing navigation or hardware stack
+        # 5. Cleanly cancel cleaner task if running without killing navigation or hardware stack
         try:
             if hasattr(self.cleaner, 'navigator') and self.cleaner.navigator:
                 self.cleaner.navigator.cancelTask()
             self.cleaner.state = S.IDLE
         except Exception as e:
             self.get_logger().error(f"Error cancelling cleaner task: {e}")
-
-        # 4. Burst zero velocity command override to /cmd_vel
-        try:
-            for _ in range(10):
-                self.publish_twist(0.0, 0.0)
-                time.sleep(0.02)
-        except Exception as e:
-            self.get_logger().error(f"Error publishing zero twist: {e}")
 
     def handle_dock_request(self):
         try:
