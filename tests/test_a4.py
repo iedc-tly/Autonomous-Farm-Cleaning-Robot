@@ -12,6 +12,7 @@ class TestA4AuthenticationAndHygiene(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.environ['ROVER_TOKEN'] = 'secret-test-token-12345'
+        os.environ['ROVER_REQUIRE_AUTH'] = '1'
         if not rclpy.ok():
             rclpy.init()
 

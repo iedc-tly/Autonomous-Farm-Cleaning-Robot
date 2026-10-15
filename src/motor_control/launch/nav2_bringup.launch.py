@@ -54,6 +54,8 @@ def generate_launch_description():
         executable='robot_state_publisher',
         name='robot_state_publisher',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[{
             'robot_description': robot_description_content,
             'use_sim_time': use_sim_time,
@@ -66,6 +68,8 @@ def generate_launch_description():
         executable='motor_node',
         name='motor_node',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
     )
 
     # ---- encoder_odom_node ----
@@ -74,6 +78,8 @@ def generate_launch_description():
         executable='encoder_odom_node',
         name='encoder_odom_node',
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[{
             'invert_all': True,
             'use_imu': False,

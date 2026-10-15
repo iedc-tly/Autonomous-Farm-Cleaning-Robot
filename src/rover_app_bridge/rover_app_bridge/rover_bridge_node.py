@@ -20,6 +20,7 @@ import yaml
 import secrets
 import hmac
 import re
+import tempfile
 
 import rclpy
 from rclpy.node import Node
@@ -43,6 +44,52 @@ def robot_home() -> str:
 LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/src/motor_control/config/locations.yaml")
 INSTALL_LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/install/motor_control/share/motor_control/config/locations.yaml")
 SNAKE_WAYPOINTS_FILE = os.path.join(robot_home(), "ros2_ws/snake_waypoints.yaml")
+
+
+def save_cached_waypoints(filepath: str, waypoints: list, meta: dict):
+    """Atomically write waypoints and meta to YAML file using temporary file and atomic replace."""
+    dir_name = os.path.dirname(os.path.abspath(filepath))
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix="waypoints_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, 'w') as f:
+            yaml.dump({'meta': meta, 'num_waypoints': len(waypoints), 'waypoints': waypoints}, f, default_flow_style=False)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
+
+CHAINED_WAYPOINTS_FILE = os.path.join(robot_home(), "ros2_ws/custom_waypoints.yaml")
+
+
+def save_chained_waypoints(waypoints: list):
+    """Atomically persist custom chained waypoints to YAML file."""
+    try:
+        dir_name = os.path.dirname(os.path.abspath(CHAINED_WAYPOINTS_FILE))
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix="custom_wp_", suffix=".tmp")
+        with os.fdopen(fd, 'w') as f:
+            yaml.dump({'waypoints': waypoints}, f, default_flow_style=False)
+        os.replace(tmp_path, CHAINED_WAYPOINTS_FILE)
+    except Exception:
+        pass
+
+
+def load_chained_waypoints() -> list:
+    """Load persisted custom chained waypoints if present."""
+    if os.path.exists(CHAINED_WAYPOINTS_FILE):
+        try:
+            with open(CHAINED_WAYPOINTS_FILE, 'r') as f:
+                d = yaml.safe_load(f)
+                if d and isinstance(d.get('waypoints'), list):
+                    return d['waypoints']
+        except Exception:
+            pass
+    return []
+
 
 
 def get_or_create_rover_token() -> str:
@@ -73,6 +120,12 @@ def get_or_create_rover_token() -> str:
 
 
 ROVER_TOKEN = get_or_create_rover_token()
+
+
+def is_auth_required() -> bool:
+    """Returns True if token authentication is enforced, False otherwise."""
+    val = os.environ.get("ROVER_REQUIRE_AUTH", "").strip().lower()
+    return val in ("true", "1", "yes", "on")
 
 
 def _clamp(v, lo, hi):
@@ -270,6 +323,7 @@ class BridgeNode(Node):
 
         self.current_goal_handle = None
         self.cancel_requested = False
+        self.chained_waypoints = load_chained_waypoints()
 
         self.status = {
             'e_stop': False,
@@ -313,6 +367,7 @@ class BridgeNode(Node):
             return False
 
         if self.cleaner.nav is None or self.cleaner.nav.poll() is not None:
+            kill_all_zombies()
             cmd = f"ros2 launch motor_control nav2_bringup.launch.py map:={map_yaml}"
             self.cleaner.nav = launch(cmd)
 
@@ -333,71 +388,59 @@ class BridgeNode(Node):
         return False
 
     def restart_nav2(self) -> bool:
-        """Restart Nav2 stack cleanly without touching hardware drivers."""
-        import subprocess
+        """Restart Nav2 stack cleanly."""
         self.get_logger().warn("[BridgeNode] Restarting Nav2 navigation stack...")
         if self.cleaner.nav is not None:
             stop(self.cleaner.nav, timeout=3.0)
             self.cleaner.nav = None
-        # Clean up only Nav2 nodes, preserving motor_node, encoder_odom_node, rplidar_node
-        nav2_targets = [
-            "bt_navigator", "controller_server", "planner_server",
-            "behavior_server", "waypoint_follower", "amcl", "map_server"
-        ]
-        for target in nav2_targets:
-            subprocess.run(f"pkill -9 -f {target} >/dev/null 2>&1", shell=True)
+        kill_all_zombies()
         time.sleep(1.0)
         return self.ensure_nav2_active()
 
 
-    def publish_initial_dock_pose(self, dock=None):
-        """Publish initial pose estimation (dock position) to AMCL /initialpose and trigger stationary scan-sharpening."""
-        if dock is None:
-            locs, _ = load_and_validate_locations()
-            dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+    def publish_initial_pose(self, x: float, y: float, yaw: float = 0.0, save_as_dock: bool = False):
+        """Publish initial pose estimation (2D Pose Estimate) to AMCL /initialpose and trigger stationary scan-sharpening."""
+        try:
+            x_f = float(x)
+            y_f = float(y)
+            yaw_f = float(yaw)
+        except (ValueError, TypeError) as e:
+            self.get_logger().error(f"[BridgeNode] Invalid initial pose values: {e}")
+            return False, f"Invalid pose coordinates: {e}"
 
         map_yaml = self.cleaner.map_yaml
-        if not os.path.exists(map_yaml):
-            self.get_logger().warn(f"[BridgeNode] Map {map_yaml} not found. Cannot verify dock pose extent.")
-            return
-
-        try:
-            with open(map_yaml, 'r') as f:
-                meta = yaml.safe_load(f)
-            from PIL import Image
-            img_rel = meta['image']
-            img_path = img_rel if img_rel.startswith('/') else os.path.join(os.path.dirname(map_yaml), img_rel)
-            if not os.path.exists(img_path):
-                self.get_logger().warn(f"[BridgeNode] Map image {img_path} not found.")
-                return
-            with Image.open(img_path) as img:
-                w, h = img.size
-            res = float(meta['resolution'])
-            ox = float(meta['origin'][0])
-            oy = float(meta['origin'][1])
-            xmin = ox
-            xmax = ox + w * res
-            ymin = oy
-            ymax = oy + h * res
-        except Exception as e:
-            self.get_logger().warn(f"[BridgeNode] Failed to read map extent from {map_yaml}: {e}")
-            return
-
-        dock_x = float(dock.get('x', 0.0))
-        dock_y = float(dock.get('y', 0.0))
-        if dock_x < xmin or dock_x > xmax or dock_y < ymin or dock_y > ymax:
-            self.get_logger().warn(
-                f"[BridgeNode] Dock pose ({dock_x:.2f}, {dock_y:.2f}) lies outside map extent "
-                f"[{xmin:.2f}, {xmax:.2f}, {ymin:.2f}, {ymax:.2f}]. Not publishing."
-            )
-            return
+        if os.path.exists(map_yaml):
+            try:
+                with open(map_yaml, 'r') as f:
+                    meta = yaml.safe_load(f)
+                from PIL import Image
+                img_rel = meta.get('image', '')
+                img_path = img_rel if img_rel.startswith('/') else os.path.join(os.path.dirname(map_yaml), img_rel)
+                if os.path.exists(img_path):
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                    res = float(meta.get('resolution', 0.05))
+                    ox = float(meta['origin'][0])
+                    oy = float(meta['origin'][1])
+                    xmin = ox
+                    xmax = ox + w * res
+                    ymin = oy
+                    ymax = oy + h * res
+                    if x_f < xmin or x_f > xmax or y_f < ymin or y_f > ymax:
+                        self.get_logger().warn(
+                            f"[BridgeNode] Warning: Pose ({x_f:.2f}, {y_f:.2f}) lies outside map extent "
+                            f"[{xmin:.2f}, {xmax:.2f}, {ymin:.2f}, {ymax:.2f}]."
+                        )
+            except Exception as e:
+                self.get_logger().warn(f"[BridgeNode] Failed to check map extent from {map_yaml}: {e}")
 
         p = PoseWithCovarianceStamped()
         p.header.frame_id = 'map'
         p.header.stamp = self.get_clock().now().to_msg()
-        p.pose.pose.position.x = float(dock['x'])
-        p.pose.pose.position.y = float(dock['y'])
-        q = yaw_to_quaternion(float(dock['yaw']))
+        p.pose.pose.position.x = x_f
+        p.pose.pose.position.y = y_f
+        p.pose.pose.position.z = 0.0
+        q = yaw_to_quaternion(yaw_f)
         p.pose.pose.orientation.x = q['x']
         p.pose.pose.orientation.y = q['y']
         p.pose.pose.orientation.z = q['z']
@@ -407,11 +450,34 @@ class BridgeNode(Node):
         p.pose.covariance[35] = 0.015
 
         for _ in range(5):
+            p.header.stamp = self.get_clock().now().to_msg()
             self.pub_initial_pose.publish(p)
             time.sleep(0.04)
 
+        if save_as_dock:
+            locs, _ = load_and_validate_locations()
+            if not locs:
+                locs = {}
+            locs['dock'] = {
+                'x': float(round(x_f, 3)),
+                'y': float(round(y_f, 3)),
+                'yaw': float(round(yaw_f, 3))
+            }
+            save_locations_dict(locs)
+            broadcast('/rover/locations', locs)
+            self.get_logger().info(f"[BridgeNode] Saved new initial pose as default dock in locations.yaml: {locs['dock']}")
+
         # Trigger stationary AMCL scan-matching sharpening burst in background thread
-        threading.Thread(target=self.sharpen_pose_stationary, daemon=True).start()
+        threading.Thread(target=self.sharpen_pose_stationary, args=(3,), daemon=True).start()
+        self.get_logger().info(f"[BridgeNode] Published initial pose: ({x_f:.3f}, {y_f:.3f}, {yaw_f:.3f} rad). Triggered scan sharpening.")
+        return True, None
+
+    def publish_initial_dock_pose(self, dock=None):
+        """Publish initial pose estimation (dock position) to AMCL /initialpose and trigger stationary scan-sharpening."""
+        if dock is None:
+            locs, _ = load_and_validate_locations()
+            dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        self.publish_initial_pose(dock.get('x', 0.0), dock.get('y', 0.0), dock.get('yaw', 0.0), save_as_dock=False)
 
     def sharpen_pose_stationary(self, num_updates: int = 2):
         """Burst no-motion updates to AMCL to snap live LiDAR scan directly to map walls while stationary."""
@@ -456,7 +522,26 @@ class BridgeNode(Node):
                     'w': float(round(q.w, 4))
                 }
             }
-        except Exception:
+        except Exception as e:
+            if hasattr(self, 'corrector') and self.corrector and getattr(self.corrector, 'latest_pose', None):
+                p = self.corrector.latest_pose.pose.pose
+                t = p.position
+                q = p.orientation
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                return {
+                    'x': float(round(t.x, 3)),
+                    'y': float(round(t.y, 3)),
+                    'yaw': float(round(yaw, 3)),
+                    'yaw_deg': float(round(math.degrees(yaw), 1)),
+                    'orientation': {
+                        'x': float(round(q.x, 4)),
+                        'y': float(round(q.y, 4)),
+                        'z': float(round(q.z, 4)),
+                        'w': float(round(q.w, 4))
+                    }
+                }
             return None
 
     def _auto_update_sweep_bounds(self, locs: dict):
@@ -1207,6 +1292,313 @@ class BridgeNode(Node):
                     self.task = "pit"
                 self._run_goto_pose("pit", locs['pit'])
 
+    def handle_map_info(self):
+        try:
+            map_yaml = self.cleaner.map_yaml
+            if not os.path.exists(map_yaml):
+                return jsonify(ok=False, error="Map file not found"), 404
+            with open(map_yaml, 'r') as f:
+                meta = yaml.safe_load(f)
+            img_rel = meta.get('image', '')
+            img_path = img_rel if img_rel.startswith('/') else os.path.join(os.path.dirname(map_yaml), img_rel)
+            w, h = 0, 0
+            if os.path.exists(img_path):
+                from PIL import Image
+                with Image.open(img_path) as im:
+                    w, h = im.size
+            res = float(meta.get('resolution', 0.05))
+            orig = [float(x) for x in meta.get('origin', [0.0, 0.0, 0.0])]
+            xmin = orig[0]
+            xmax = orig[0] + w * res
+            ymin = orig[1]
+            ymax = orig[1] + h * res
+            return jsonify(
+                ok=True,
+                resolution=res,
+                origin=orig,
+                width=w,
+                height=h,
+                extent={"xmin": round(xmin, 3), "xmax": round(xmax, 3), "ymin": round(ymin, 3), "ymax": round(ymax, 3)},
+                image_url="/api/map_image",
+                map_image_url="/api/map_image",
+                url="/api/map_image"
+            ), 200
+        except Exception as e:
+            return jsonify(ok=False, error=str(e)), 500
+
+    def handle_set_initial_pose(self, data: dict):
+        if not isinstance(data, dict):
+            return jsonify(ok=False, error="Invalid payload, expected JSON object"), 400
+        try:
+            x = data.get('x')
+            y = data.get('y')
+            if x is None or y is None:
+                return jsonify(ok=False, error="Missing required 'x' or 'y' in payload"), 400
+            
+            yaw = 0.0
+            if 'yaw' in data:
+                yaw = float(data['yaw'])
+            elif 'yaw_deg' in data:
+                yaw = float(data['yaw_deg']) * math.pi / 180.0
+            elif 'theta' in data:
+                yaw = float(data['theta'])
+            else:
+                cur = self.get_current_pose()
+                if cur and 'yaw' in cur:
+                    yaw = cur['yaw']
+
+            save_as_dock = bool(data.get('save_as_dock') or data.get('dock', False))
+            ok, err = self.publish_initial_pose(x, y, yaw, save_as_dock=save_as_dock)
+            if not ok:
+                return jsonify(ok=False, error=err), 400
+            
+            time.sleep(0.5)
+            updated_pose = self.get_current_pose() or {
+                'x': float(round(float(x), 3)),
+                'y': float(round(float(y), 3)),
+                'yaw': float(round(float(yaw), 3)),
+                'yaw_deg': float(round(math.degrees(float(yaw)), 1))
+            }
+            broadcast('/rover/status', self.get_status_response())
+            return jsonify(ok=True, status="initial_pose_set", pose=updated_pose, saved_as_dock=save_as_dock), 200
+        except Exception as e:
+            self.get_logger().error(f"Error setting initial pose: {e}")
+            return jsonify(ok=False, error=str(e)), 500
+
+    def handle_get_waypoints(self):
+        with self.lock:
+            wps = list(self.chained_waypoints)
+        return jsonify(ok=True, waypoints=wps, count=len(wps)), 200
+
+    def handle_set_waypoints(self, data: dict):
+        wps = data.get('waypoints')
+        if not isinstance(wps, list):
+            return jsonify(ok=False, error="Invalid waypoints format, expected list"), 400
+        cleaned = []
+        for i, wp in enumerate(wps):
+            if not isinstance(wp, dict) or 'x' not in wp or 'y' not in wp:
+                continue
+            x = float(wp['x'])
+            y = float(wp['y'])
+            yaw = float(wp.get('yaw', 0.0))
+            cleaned.append({
+                'id': i + 1,
+                'x': round(x, 3),
+                'y': round(y, 3),
+                'yaw': round(yaw, 3),
+                'yaw_deg': round(math.degrees(yaw), 1)
+            })
+        with self.lock:
+            self.chained_waypoints = cleaned
+            save_chained_waypoints(cleaned)
+        return jsonify(ok=True, waypoints=cleaned, count=len(cleaned)), 200
+
+    def handle_add_waypoint(self, data: dict):
+        try:
+            if not data or 'x' not in data or 'y' not in data:
+                return jsonify(ok=False, error="Missing 'x' or 'y' in payload"), 400
+            x = float(data['x'])
+            y = float(data['y'])
+            yaw = float(data.get('yaw', 0.0))
+            with self.lock:
+                idx = len(self.chained_waypoints) + 1
+                wp = {
+                    'id': idx,
+                    'x': round(x, 3),
+                    'y': round(y, 3),
+                    'yaw': round(yaw, 3),
+                    'yaw_deg': round(math.degrees(yaw), 1)
+                }
+                self.chained_waypoints.append(wp)
+                save_chained_waypoints(self.chained_waypoints)
+                wps = list(self.chained_waypoints)
+            return jsonify(ok=True, added=wp, waypoints=wps, count=len(wps)), 200
+        except Exception as e:
+            return jsonify(ok=False, error=str(e)), 400
+
+    def handle_add_current_pose_waypoint(self):
+        pose = self.get_current_pose()
+        if not pose:
+            return jsonify(ok=False, error="Current robot pose not available from TF (map -> base_link)"), 412
+        with self.lock:
+            idx = len(self.chained_waypoints) + 1
+            wp = {
+                'id': idx,
+                'x': pose['x'],
+                'y': pose['y'],
+                'yaw': pose['yaw'],
+                'yaw_deg': pose['yaw_deg']
+            }
+            self.chained_waypoints.append(wp)
+            save_chained_waypoints(self.chained_waypoints)
+            wps = list(self.chained_waypoints)
+        return jsonify(ok=True, added=wp, waypoints=wps, count=len(wps)), 200
+
+    def handle_clear_waypoints(self):
+        with self.lock:
+            self.chained_waypoints = []
+            save_chained_waypoints([])
+        return jsonify(ok=True, waypoints=[], count=0), 200
+
+    def handle_delete_waypoint(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.chained_waypoints):
+                target_idx = index
+            elif 1 <= index <= len(self.chained_waypoints):
+                target_idx = index - 1
+            else:
+                return jsonify(ok=False, error=f"Index {index} out of range"), 404
+            removed = self.chained_waypoints.pop(target_idx)
+            for i, wp in enumerate(self.chained_waypoints):
+                wp['id'] = i + 1
+            save_chained_waypoints(self.chained_waypoints)
+            wps = list(self.chained_waypoints)
+        return jsonify(ok=True, removed=removed, waypoints=wps, count=len(wps)), 200
+
+    def handle_execute_waypoints(self, data: dict = None):
+        try:
+            if data and isinstance(data.get('waypoints'), list) and len(data['waypoints']) > 0:
+                self.handle_set_waypoints(data)
+
+            with self.lock:
+                waypoints = list(self.chained_waypoints)
+
+            if not waypoints:
+                return jsonify(ok=False, error="No waypoints to execute. Please add at least 1 goal pose."), 400
+
+            if not self.ensure_nav2_active():
+                return jsonify(ok=False, error="Nav2 stack failed to become active"), 412
+
+            ok, err_code = self._try_begin("CHAINING_GOALS", "chain_goals", len(waypoints))
+            if not ok:
+                if err_code == "e_stop_active":
+                    return jsonify(error="e_stop_active"), 403
+                return jsonify(error="busy"), 409
+
+            try:
+                threading.Thread(
+                    target=self._run_chained_waypoints,
+                    args=(waypoints,),
+                    daemon=True
+                ).start()
+            except Exception:
+                with self.lock:
+                    self.state = "IDLE"
+                    self.task = None
+                raise
+
+            return jsonify(accepted=True, waypoints=len(waypoints)), 202
+        except Exception as e:
+            self.get_logger().error(f"Error handling execute waypoints request: {e}")
+            return jsonify(ok=False, error=str(e)), 500
+
+    def _run_chained_waypoints(self, waypoints):
+        outcome = "failed"
+        err = "navigation failed"
+        try:
+            if not self.ensure_nav2_active():
+                with self.lock:
+                    self.last_task = "chain_goals"
+                    self.last_result = "failed"
+                    self.error = "nav2 bringup failed"
+                    self.state = "IDLE"
+                    self.task = None
+                return
+
+            self.set_turn_mode(False)
+            self.get_logger().info(f"[BridgeNode] Executing chained goals with {len(waypoints)} waypoints...")
+
+            goal_msg = FollowWaypoints.Goal()
+            pose_list = []
+            for wp in waypoints:
+                p = PoseStamped()
+                p.header.frame_id = 'map'
+                p.header.stamp = self.get_clock().now().to_msg()
+                p.pose.position.x = float(wp['x'])
+                p.pose.position.y = float(wp['y'])
+                yaw = float(wp.get('yaw', 0.0))
+                q = wp.get('orientation') or yaw_to_quaternion(yaw)
+                p.pose.orientation.x = float(q['x'])
+                p.pose.orientation.y = float(q['y'])
+                p.pose.orientation.z = float(q['z'])
+                p.pose.orientation.w = float(q['w'])
+                pose_list.append(p)
+            goal_msg.poses = pose_list
+
+            future_goal = self.follow_waypoints_client.send_goal_async(
+                goal_msg, 
+                feedback_callback=self._on_sweep_feedback
+            )
+
+            start_t = time.time()
+            while not future_goal.done() and (time.time() - start_t) < 5.0:
+                time.sleep(0.02)
+
+            if not future_goal.done() or not future_goal.result().accepted:
+                self.get_logger().error("[BridgeNode] Chained goals rejected by Nav2!")
+                with self.lock:
+                    self.last_task = "chain_goals"
+                    self.last_result = "failed"
+                    self.error = "waypoints goal rejected"
+                    self.state = "IDLE"
+                    self.task = None
+                return
+
+            self.current_goal_handle = future_goal.result()
+            self.get_logger().info("[BridgeNode] Chained goals accepted by Nav2!")
+
+            # Stationary 2D pose sharpening before moving
+            if self.corrector:
+                try:
+                    self.corrector.sharpen_pose(timeout_sec=0.1)
+                except Exception as e:
+                    self.get_logger().warn(f"Pose corrector note: {e}")
+
+            future_res = self.current_goal_handle.get_result_async()
+
+            while not future_res.done():
+                with self.lock:
+                    if self.cancel_requested or self.status.get('e_stop', False):
+                        self.get_logger().info("[BridgeNode] Cancelling chained goals...")
+                        try:
+                            self.current_goal_handle.cancel_goal_async()
+                        except Exception:
+                            pass
+                        break
+                time.sleep(0.1)
+
+            with self.lock:
+                if self.cancel_requested or self.status.get('e_stop', False):
+                    outcome = "canceled"
+                    err = "canceled"
+                else:
+                    action_res = future_res.result()
+                    if action_res and action_res.status == GoalStatus.STATUS_SUCCEEDED:
+                        outcome = "succeeded"
+                        err = None
+                    elif action_res and action_res.status == GoalStatus.STATUS_CANCELED:
+                        outcome = "canceled"
+                        err = "canceled"
+                    else:
+                        outcome = "failed"
+                        err = "navigation failed"
+
+        except Exception as e:
+            self.get_logger().error(f"Error in chained goals: {e}")
+            outcome = "failed"
+            err = str(e)
+
+        with self.lock:
+            self.last_task = "chain_goals"
+            self.last_result = outcome
+            self.error = err
+            self.state = "IDLE"
+            self.task = None
+            self.current_goal_handle = None
+            if outcome == "succeeded":
+                self.percent = 100.0
+                self.waypoint_index = self.waypoint_total
+
     def get_status(self):
         with self.lock:
             st = dict(self.status)
@@ -1242,7 +1634,6 @@ class BridgeNode(Node):
             self.publish_twist(0.0, 0.0)
             if hasattr(self, 'cleaner') and self.cleaner:
                 self.cleaner.stop_all_locked()
-            kill_all_zombies()
         except Exception:
             pass
         super().destroy_node()
@@ -1358,7 +1749,7 @@ def handle_message(node: BridgeNode, conn: dict, raw: str):
 
 
 def render_app_html() -> str:
-    return """<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1568,6 +1959,14 @@ def render_app_html() -> str:
       <span>🎮 Manual Drive & Position Control</span>
       <span id="speedVal" style="color:#38bdf8;">0.5x</span>
     </div>
+
+    <!-- Prominent Emergency Stop Warning Banner -->
+    <div id="estopAlert" style="display:none; background:#450a0a; border:2px solid #ef4444; border-radius:8px; padding:12px; margin-bottom:12px; text-align:center;">
+      <div style="font-weight:bold; font-size:1.0rem; color:#fca5a5; margin-bottom:4px;">🛑 EMERGENCY STOP ACTIVE</div>
+      <div style="font-size:0.80rem; color:#fecaca; margin-bottom:10px;">Motors are locked. Tap below to re-enable driving:</div>
+      <button class="btn btn-success" id="btnResumeTop" style="width:100%; padding:11px; font-weight:bold; font-size:0.95rem;">▶️ UNLOCK & RESUME MOTORS</button>
+    </div>
+
     <div class="drive-pad">
       <div style="grid-column: 2; grid-row: 1;">
         <button class="pad-btn" id="btnFwd" style="width:100%; height:100%;">▲</button>
@@ -1595,7 +1994,17 @@ def render_app_html() -> str:
 
   <!-- 1-Click Mapping Section -->
   <div class="card">
-    <div class="card-head">🗺️ Map Environment</div>
+    <div class="card-head">
+      <span>🗺️ Map Environment</span>
+      <span id="mapDimensionsBadge" class="badge">Loading Map...</span>
+    </div>
+    
+    <!-- Visible Map Preview Image -->
+    <div style="text-align:center; margin: 10px 0; background: #080c14; border: 1px solid #1a253c; border-radius: 8px; padding: 10px;">
+      <img id="mapImg" src="/api/map_image" alt="Saved Occupancy Map" style="max-width: 100%; max-height: 250px; object-fit: contain; border-radius: 6px; display: block; margin: 0 auto; background: #000;" />
+      <div id="mapMetaText" style="margin-top: 6px; font-size: 0.72rem; color: #94a3b8; font-family: monospace;">Loading map info...</div>
+    </div>
+
     <div class="btn-grid">
       <button class="btn btn-primary" id="btnStartMap">🗺️ Start Mapping</button>
       <button class="btn btn-success" id="btnSaveMap">💾 Save Map</button>
@@ -1604,8 +2013,7 @@ def render_app_html() -> str:
       <button class="btn btn-blue" id="btnAlignMap">🎯 Snap / Align Map</button>
       <button class="btn btn-dark" id="btnRefreshMap">🖼️ Refresh Map</button>
     </div>
-    <img id="mapImg" src="/map_image" alt="Map Preview" style="display:none;" />
-    <div class="tip">Tap 'Snap / Align Map' right after starting navigation if the live scan isn't fully aligned yet.</div>
+    <div class="tip">Tap 'Snap / Align Map' right after starting navigation to sharpen LiDAR scan against map walls.</div>
   </div>
 
   <!-- 1-Click Location Configuration -->
@@ -1621,7 +2029,54 @@ def render_app_html() -> str:
       <button class="btn btn-dark" id="btnSaveC2">📐 Save Corner 2 (Max)</button>
     </div>
     <button class="btn btn-dark" id="btnAutoRoom" style="width:100%;">🏠 Auto-Detect Entire Room Bounds</button>
-    <div class="tip">Drive robot to spot using Drive Pad above, then tap Save to store coordinates.</div>
+  </div>
+
+  <!-- Chained Goals / Multi-Waypoint Navigation & Localization -->
+  <div class="card">
+    <div class="card-head">
+      <span>🎯 Chained Goals & Localization</span>
+      <span id="wpBadge" class="badge">0 Goals</span>
+    </div>
+
+    <!-- Mode Selector for Interactive Map Canvas -->
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+      <div style="display:flex; gap:6px;">
+        <button id="btnModeGoal" class="btn btn-primary" style="padding:4px 10px; font-size:0.75rem; border-radius:16px;">⛳ Add Goal</button>
+        <button id="btnModePose" class="btn btn-dark" style="padding:4px 10px; font-size:0.75rem; border-radius:16px;">📍 Set Robot Position</button>
+      </div>
+      <label style="display:inline-flex; align-items:center; gap:5px; font-size:0.72rem; color:#94a3b8; cursor:pointer;">
+        <input type="checkbox" id="chkSaveAsDock" checked style="cursor:pointer;" /> Also save as Dock
+      </label>
+    </div>
+    
+    <!-- Interactive Map Canvas for Clicking Goals & Setting Pose -->
+    <div style="position: relative; width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid #23314d; background: #050811;">
+      <canvas id="mapCanvas" style="width: 100%; height: 260px; display: block; cursor: crosshair; touch-action: none;"></canvas>
+      <div id="canvasModeBanner" style="position: absolute; top: 6px; left: 8px; font-size: 0.72rem; color: #38bdf8; background: rgba(11,15,25,0.85); padding: 3px 8px; border-radius: 4px; pointer-events: none; border: 1px solid #1e293b;">
+        👆 Tap map to add goal pose
+      </div>
+      <div id="coordDisplay" style="position: absolute; bottom: 6px; right: 8px; font-size: 0.70rem; font-family: monospace; color: #94a3b8; background: rgba(11,15,25,0.85); padding: 2px 7px; border-radius: 4px; pointer-events: none;">
+        X: -- Y: --
+      </div>
+    </div>
+
+    <!-- Quick Action Buttons -->
+    <div class="btn-grid">
+      <button class="btn btn-primary" id="btnAddCurrentWp">➕ Add Current Robot Pose</button>
+      <button class="btn btn-dark" id="btnAddManualWp">📍 Enter Coordinates</button>
+    </div>
+
+    <!-- Chained Waypoints Queue List -->
+    <div id="wpList" style="max-height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; font-family: monospace; font-size: 0.80rem;">
+      <div style="color: var(--muted); text-align: center; padding: 10px;">No goal poses set. Tap map or 'Add Current Robot Pose'.</div>
+    </div>
+
+    <!-- Execution and Clear Buttons -->
+    <div class="btn-grid">
+      <button class="btn btn-success" id="btnRunChainedGoals" style="font-size: 0.95rem; padding: 13px;">🚀 Execute Chained Goals</button>
+      <button class="btn btn-danger" id="btnClearChainedGoals">🗑️ Clear All</button>
+    </div>
+    <div class="tip">Switch to '📍 Set Robot Position' mode to click where the robot is physically placed: snaps the URDF model and LiDAR scan directly to the map walls.</div>
   </div>
 
   <!-- Mission Execution & E-Stop -->
@@ -1648,13 +2103,10 @@ def render_app_html() -> str:
 </div>
 
 <script>
-  let roverToken = localStorage.getItem('rover_token') || '';
-  if (!roverToken) {
-    const inputToken = prompt('Enter Rover Access Token (X-Rover-Token):');
-    if (inputToken) {
-      roverToken = inputToken.trim();
-      localStorage.setItem('rover_token', roverToken);
-    }
+  const serverToken = '__ROVER_TOKEN__';
+  let roverToken = serverToken || localStorage.getItem('rover_token') || '';
+  if (serverToken) {
+    localStorage.setItem('rover_token', serverToken);
   }
 
   function authHeaders(custom = {}) {
@@ -1704,12 +2156,25 @@ def render_app_html() -> str:
     }
   }
 
-  function drive(direction) {
-    fetch('/api/cmd_vel', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ direction: direction, speed_scale: parseFloat(speedSlider.value) })
-    }).catch(() => {});
+  async function drive(direction) {
+    try {
+      const res = await fetch('/api/cmd_vel', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ direction: direction, speed_scale: parseFloat(speedSlider.value) })
+      });
+      if (res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        log('🛑 ' + (data.message || 'Emergency Stop is active! Press RESUME to unlock motors.'));
+        const alertEl = document.getElementById('estopAlert');
+        if (alertEl) alertEl.style.display = 'block';
+        fetchStatus();
+      } else if (!res.ok && res.status !== 200) {
+        log(`Drive error: ${res.status}`);
+      }
+    } catch (e) {
+      log(`Network error: ${e.message}`);
+    }
   }
 
   // Drive buttons touch & click press-and-hold
@@ -1766,17 +2231,25 @@ def render_app_html() -> str:
   document.getElementById('btnGoPit').addEventListener('click', () => postAPI('/api/pit'));
   document.getElementById('btnEstop').addEventListener('click', () => postAPI('/api/e_stop'));
   document.getElementById('btnResume').addEventListener('click', () => postAPI('/api/resume'));
+  const btnResumeTop = document.getElementById('btnResumeTop');
+  if (btnResumeTop) {
+    btnResumeTop.addEventListener('click', () => postAPI('/api/resume'));
+  }
 
   document.getElementById('btnRefreshMap').addEventListener('click', () => {
-    mapImg.style.display = 'block';
-    mapImg.src = '/map_image?token=' + encodeURIComponent(roverToken) + '&t=' + Date.now();
+    if (mapImg) {
+      mapImg.src = '/api/map_image?token=' + encodeURIComponent(roverToken) + '&t=' + Date.now();
+    }
+    fetchMapInfo();
   });
 
   function updatePoseUI(p) {
     if (!p) return;
+    currentRobotPose = p;
     posX.textContent = typeof p.x === 'number' ? p.x.toFixed(2) : '--';
     posY.textContent = typeof p.y === 'number' ? p.y.toFixed(2) : '--';
     posYaw.textContent = typeof p.yaw_deg === 'number' ? p.yaw_deg.toFixed(1) : (typeof p.yaw === 'number' ? (p.yaw * 180 / Math.PI).toFixed(1) : '--');
+    drawMap();
   }
 
   function updateStateUI(st) {
@@ -1784,17 +2257,25 @@ def render_app_html() -> str:
     const s = st.state || 'IDLE';
     stateBadge.textContent = s;
     stateBadge.className = 'badge';
+    const alertEl = document.getElementById('estopAlert');
     if (st.e_stop) {
       stateBadge.textContent = 'E-STOP';
       stateBadge.classList.add('red');
-    } else if (s === 'MAPPING') {
-      stateBadge.classList.add('amber');
-    } else if (s === 'SWEEPING' || s === 'DOCKING' || s === 'GOING_TO_PIT' || s === 'NAVIGATING_TO_PIT') {
-      stateBadge.classList.add('blue');
+      if (alertEl) alertEl.style.display = 'block';
     } else {
-      stateBadge.classList.add('green');
+      if (alertEl) alertEl.style.display = 'none';
+      if (s === 'MAPPING') {
+        stateBadge.classList.add('amber');
+      } else if (s === 'SWEEPING' || s === 'DOCKING' || s === 'GOING_TO_PIT' || s === 'NAVIGATING_TO_PIT' || s === 'CHAINING_GOALS') {
+        stateBadge.classList.add('blue');
+      } else {
+        stateBadge.classList.add('green');
+      }
     }
     if (st.pose) updatePoseUI(st.pose);
+    if (st.task === 'chain_goals' && st.waypoint_total > 0) {
+      log(`Navigating Chained Goals: ${st.waypoint_index || 1} of ${st.waypoint_total} (${st.percent || 0}%)`);
+    }
   }
 
   function updateLocsUI(locs) {
@@ -1828,6 +2309,287 @@ def render_app_html() -> str:
     } catch (_) {}
   }
 
+  /* --- Interactive Map Canvas & Chained Goals Logic --- */
+  let chainedWaypoints = [];
+  let mapMeta = null;
+  let mapImageObj = null;
+  const mapCanvas = document.getElementById('mapCanvas');
+  const ctx = mapCanvas ? mapCanvas.getContext('2d') : null;
+  let currentRobotPose = null;
+  let canvasMode = 'goal'; // 'goal' or 'pose'
+
+  const btnModeGoal = document.getElementById('btnModeGoal');
+  const btnModePose = document.getElementById('btnModePose');
+  const canvasModeBanner = document.getElementById('canvasModeBanner');
+  const chkSaveAsDock = document.getElementById('chkSaveAsDock');
+
+  if (btnModeGoal && btnModePose) {
+    btnModeGoal.addEventListener('click', () => {
+      canvasMode = 'goal';
+      btnModeGoal.className = 'btn btn-primary';
+      btnModePose.className = 'btn btn-dark';
+      if (canvasModeBanner) {
+        canvasModeBanner.textContent = '👆 Tap map to add goal pose';
+        canvasModeBanner.style.color = '#38bdf8';
+      }
+    });
+    btnModePose.addEventListener('click', () => {
+      canvasMode = 'pose';
+      btnModePose.className = 'btn btn-amber';
+      btnModeGoal.className = 'btn btn-dark';
+      if (canvasModeBanner) {
+        canvasModeBanner.textContent = '📍 Tap where robot is placed to align URDF model & LiDAR scan!';
+        canvasModeBanner.style.color = '#f59e0b';
+      }
+    });
+  }
+
+  async function fetchMapInfo() {
+    try {
+      const res = await fetch('/api/map_info', { headers: authHeaders() });
+      if (res.ok) {
+        mapMeta = await res.json();
+        const metaEl = document.getElementById('mapMetaText');
+        const badgeEl = document.getElementById('mapDimensionsBadge');
+        if (metaEl && mapMeta.width) {
+          metaEl.textContent = `Size: ${mapMeta.width}×${mapMeta.height} px (${(mapMeta.width * mapMeta.resolution).toFixed(1)}m × ${(mapMeta.height * mapMeta.resolution).toFixed(1)}m) | Res: ${mapMeta.resolution}m | Origin: [${mapMeta.origin[0]}, ${mapMeta.origin[1]}]`;
+        }
+        if (badgeEl && mapMeta.width) {
+          badgeEl.textContent = `${(mapMeta.width * mapMeta.resolution).toFixed(1)}m × ${(mapMeta.height * mapMeta.resolution).toFixed(1)}m`;
+        }
+        if (mapImg) {
+          mapImg.src = '/api/map_image?t=' + Date.now();
+        }
+        loadMapCanvas();
+      }
+    } catch (_) {}
+  }
+
+  function loadMapCanvas() {
+    if (!mapMeta || !mapMeta.width || !mapCanvas) return;
+    mapImageObj = new Image();
+    mapImageObj.onload = () => {
+      mapCanvas.width = mapMeta.width;
+      mapCanvas.height = mapMeta.height;
+      drawMap();
+    };
+    mapImageObj.src = '/api/map_image?t=' + Date.now();
+  }
+
+  function worldToCanvas(wx, wy) {
+    if (!mapMeta) return { cx: 0, cy: 0 };
+    const ox = mapMeta.origin[0];
+    const oy = mapMeta.origin[1];
+    const res = mapMeta.resolution;
+    const cx = (wx - ox) / res;
+    const cy = mapMeta.height - 1 - ((wy - oy) / res);
+    return { cx, cy };
+  }
+
+  function canvasToWorld(cx, cy) {
+    if (!mapMeta) return { wx: 0, wy: 0 };
+    const ox = mapMeta.origin[0];
+    const oy = mapMeta.origin[1];
+    const res = mapMeta.resolution;
+    const wx = ox + (cx * res);
+    const wy = oy + ((mapMeta.height - 1 - cy) * res);
+    return { wx: parseFloat(wx.toFixed(3)), wy: parseFloat(wy.toFixed(3)) };
+  }
+
+  function drawMap() {
+    if (!ctx || !mapCanvas || !mapImageObj) return;
+    ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+    ctx.drawImage(mapImageObj, 0, 0);
+
+    // Draw Chained Waypoints path
+    if (chainedWaypoints && chainedWaypoints.length > 0) {
+      ctx.beginPath();
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      chainedWaypoints.forEach((wp, idx) => {
+        const { cx, cy } = worldToCanvas(wp.x, wp.y);
+        if (idx === 0) ctx.moveTo(cx, cy);
+        else ctx.lineTo(cx, cy);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw Waypoint Points
+      chainedWaypoints.forEach((wp, idx) => {
+        const { cx, cy } = worldToCanvas(wp.x, wp.y);
+        ctx.beginPath();
+        ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+        ctx.fillStyle = '#ef4444';
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(idx + 1), cx, cy);
+      });
+    }
+
+    // Draw Current Robot Pose
+    if (currentRobotPose) {
+      const { cx, cy } = worldToCanvas(currentRobotPose.x, currentRobotPose.y);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+      ctx.fillStyle = '#38bdf8';
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      const yaw = currentRobotPose.yaw || 0.0;
+      const arrowLen = 14;
+      const ax = cx + arrowLen * Math.cos(-yaw);
+      const ay = cy + arrowLen * Math.sin(-yaw);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(ax, ay);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+  }
+
+  async function fetchWaypoints() {
+    try {
+      const res = await fetch('/api/waypoints', { headers: authHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        chainedWaypoints = data.waypoints || [];
+        renderWaypointsUI();
+        drawMap();
+      }
+    } catch (_) {}
+  }
+
+  function renderWaypointsUI() {
+    const listEl = document.getElementById('wpList');
+    const badgeEl = document.getElementById('wpBadge');
+    if (badgeEl) badgeEl.textContent = `${chainedWaypoints.length} Goals`;
+    if (!listEl) return;
+
+    if (chainedWaypoints.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--muted); text-align:center; padding:10px;">No goal poses set. Tap map or "Add Current Robot Pose".</div>';
+      return;
+    }
+
+    listEl.innerHTML = '';
+    chainedWaypoints.forEach((wp, idx) => {
+      const item = document.createElement('div');
+      item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background:#080c14; border:1px solid #1a253c; border-radius:6px; padding:6px 10px;';
+      const numSpan = `<span style="background:#2563eb; color:#fff; border-radius:50%; width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; font-size:0.7rem; font-weight:bold; margin-right:6px;">${idx + 1}</span>`;
+      item.innerHTML = `<div>${numSpan}<b>Goal ${idx + 1}:</b> X: ${wp.x.toFixed(2)}m, Y: ${wp.y.toFixed(2)}m, Yaw: ${(wp.yaw_deg || (wp.yaw * 180 / Math.PI)).toFixed(0)}°</div>`;
+      
+      const delBtn = document.createElement('button');
+      delBtn.textContent = '❌';
+      delBtn.style.cssText = 'background:transparent; border:none; color:#ef4444; cursor:pointer; font-size:0.85rem; padding:2px 6px;';
+      delBtn.onclick = async () => {
+        await postAPI(`/api/waypoints/delete/${idx}`);
+        await fetchWaypoints();
+      };
+      item.appendChild(delBtn);
+      listEl.appendChild(item);
+    });
+  }
+
+  if (mapCanvas) {
+    const coordDisplay = document.getElementById('coordDisplay');
+
+    function getCanvasCoords(e) {
+      const rect = mapCanvas.getBoundingClientRect();
+      const scaleX = mapCanvas.width / rect.width;
+      const scaleY = mapCanvas.height / rect.height;
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      const cx = (clientX - rect.left) * scaleX;
+      const cy = (clientY - rect.top) * scaleY;
+      return { cx, cy };
+    }
+
+    mapCanvas.addEventListener('mousemove', (e) => {
+      const { cx, cy } = getCanvasCoords(e);
+      const { wx, wy } = canvasToWorld(cx, cy);
+      if (coordDisplay) coordDisplay.textContent = `X: ${wx.toFixed(2)} Y: ${wy.toFixed(2)}`;
+    });
+
+    mapCanvas.addEventListener('click', async (e) => {
+      const { cx, cy } = getCanvasCoords(e);
+      const { wx, wy } = canvasToWorld(cx, cy);
+
+      if (canvasMode === 'pose') {
+        const curDeg = currentRobotPose ? (currentRobotPose.yaw_deg || 0) : 0;
+        const yawDegStr = prompt(`📍 Set Robot 2D Pose Estimate\nX: ${wx.toFixed(2)}m, Y: ${wy.toFixed(2)}m\nEnter Robot Heading/Yaw in degrees (-180 to 180):`, curDeg.toFixed(0));
+        if (yawDegStr === null) return;
+        const yawDeg = parseFloat(yawDegStr || '0');
+        const yawRad = isNaN(yawDeg) ? 0.0 : (yawDeg * Math.PI / 180.0);
+        const saveAsDock = chkSaveAsDock ? chkSaveAsDock.checked : true;
+        log(`Setting Robot 2D Initial Pose to (${wx}, ${wy}) @ ${yawDeg.toFixed(0)}° (Dock: ${saveAsDock})...`);
+        const res = await postAPI('/api/initial_pose', { x: wx, y: wy, yaw: yawRad, save_as_dock: saveAsDock });
+        if (res && res.ok) {
+          log(`✅ Robot 2D Pose updated! URDF model & live LiDAR scan snapped to map.`);
+          currentRobotPose = { x: wx, y: wy, yaw: yawRad, yaw_deg: yawDeg };
+          drawMap();
+        }
+        return;
+      }
+
+      log(`Added Goal Pose at (${wx}, ${wy})`);
+      await postAPI('/api/waypoints/add', { x: wx, y: wy, yaw: 0.0 });
+      await fetchWaypoints();
+    });
+  }
+
+  document.getElementById('btnAddCurrentWp').addEventListener('click', async () => {
+    await postAPI('/api/waypoints/add_current');
+    await fetchWaypoints();
+  });
+
+  document.getElementById('btnAddManualWp').addEventListener('click', async () => {
+    const xStr = prompt('Enter Goal X coordinate (meters):', '0.0');
+    if (xStr === null) return;
+    const yStr = prompt('Enter Goal Y coordinate (meters):', '0.0');
+    if (yStr === null) return;
+    const yawStr = prompt('Enter Goal Yaw heading (degrees, optional):', '0');
+    const x = parseFloat(xStr);
+    const y = parseFloat(yStr);
+    const yawDeg = parseFloat(yawStr || '0');
+    if (isNaN(x) || isNaN(y)) {
+      alert('Invalid coordinates');
+      return;
+    }
+    const yawRad = (yawDeg * Math.PI) / 180.0;
+    await postAPI('/api/waypoints/add', { x, y, yaw: yawRad });
+    await fetchWaypoints();
+  });
+
+  document.getElementById('btnClearChainedGoals').addEventListener('click', async () => {
+    if (confirm('Clear all chained waypoints?')) {
+      await postAPI('/api/waypoints/clear');
+      await fetchWaypoints();
+    }
+  });
+
+  document.getElementById('btnRunChainedGoals').addEventListener('click', async () => {
+    if (chainedWaypoints.length === 0) {
+      alert('Please add at least 1 goal pose before executing.');
+      return;
+    }
+    log(`Executing ${chainedWaypoints.length} chained goal poses...`);
+    await postAPI('/api/waypoints/execute');
+  });
+
+  document.getElementById('btnRefreshMap').addEventListener('click', () => {
+    loadMapCanvas();
+  });
+
   let ws = null;
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1857,11 +2619,14 @@ def render_app_html() -> str:
   connectWS();
   fetchStatus();
   fetchLocations();
+  fetchMapInfo();
+  fetchWaypoints();
   setInterval(fetchStatus, 3000);
 </script>
 </body>
 </html>
 """
+    return html.replace("__ROVER_TOKEN__", ROVER_TOKEN)
 
 
 def make_flask_app(node: BridgeNode) -> Flask:
@@ -1871,6 +2636,9 @@ def make_flask_app(node: BridgeNode) -> Flask:
 
     @app.before_request
     def authenticate_request():
+        if not is_auth_required():
+            return None
+
         if request.method == 'OPTIONS':
             return None
         public_paths = {'/', '/app', '/index.html', '/health', '/api/health'}
@@ -1901,6 +2669,10 @@ def make_flask_app(node: BridgeNode) -> Flask:
                 response.headers['Access-Control-Allow-Origin'] = req_origin
                 response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-Rover-Token'
                 response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+        else:
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-Rover-Token'
+            response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
         return response
 
     @app.errorhandler(404)
@@ -2072,11 +2844,24 @@ def make_flask_app(node: BridgeNode) -> Flask:
             if request.form:
                 data.update(request.form.to_dict())
 
+            scale = node.status.get('speed_scale', 1.0)
+            if 'speed_scale' in data:
+                try:
+                    scale = float(data['speed_scale'])
+                except (ValueError, TypeError):
+                    pass
+
+            linear_x, angular_z = parse_twist_payload(data, speed_scale=scale)
+
+            # Stopping (zero velocity) is always allowed cleanly even during E-STOP
+            if abs(linear_x) < 1e-5 and abs(angular_z) < 1e-5:
+                node.publish_twist(0.0, 0.0)
+                return jsonify(ok=True, linear_x=0.0, angular_z=0.0, e_stop=node.status.get('e_stop', False)), 200
+
             if node.status.get('e_stop', False):
                 node.publish_twist(0.0, 0.0)
-                return jsonify(ok=False, error="e_stop_active"), 403
+                return jsonify(ok=False, error="e_stop_active", message="Emergency Stop is active. Tap RESUME to unlock motors."), 403
 
-            linear_x, angular_z = parse_twist_payload(data, speed_scale=node.status.get('speed_scale', 1.0))
             node.publish_twist(linear_x, angular_z)
             return jsonify(ok=True, linear_x=linear_x, angular_z=angular_z), 200
         except Exception as e:
@@ -2173,26 +2958,122 @@ def make_flask_app(node: BridgeNode) -> Flask:
         map_name = data.get('map_name') or request.args.get('map_name') or request.args.get('name')
         return node.handle_save_map(map_name=map_name)
 
-    @app.route('/map_image', methods=['GET'])
+    @app.route('/map_image', methods=['GET', 'OPTIONS'])
+    @app.route('/api/map_image', methods=['GET', 'OPTIONS'])
+    @app.route('/map', methods=['GET', 'OPTIONS'])
+    @app.route('/api/map', methods=['GET', 'OPTIONS'])
+    @app.route('/map.png', methods=['GET', 'OPTIONS'])
+    @app.route('/api/map.png', methods=['GET', 'OPTIONS'])
+    @app.route('/api/map/image', methods=['GET', 'OPTIONS'])
+    @app.route('/api/image', methods=['GET', 'OPTIONS'])
     def map_image():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
         try:
             png_bytes = map_pgm_to_png_bytes(node.cleaner.map_yaml)
             if not png_bytes:
                 return jsonify(error='Map image not found or invalid'), 404
-            return Response(png_bytes, mimetype='image/png')
+            resp = Response(png_bytes, mimetype='image/png')
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            return resp
         except Exception as e:
             return jsonify(ok=False, error=str(e)), 500
 
+    @app.route('/initial_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/api/initial_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/set_initial_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/api/set_initial_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/set_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/api/set_pose', methods=['POST', 'OPTIONS'])
+    @app.route('/2d_pose_estimate', methods=['POST', 'OPTIONS'])
+    @app.route('/api/2d_pose_estimate', methods=['POST', 'OPTIONS'])
+    def post_initial_pose():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        data = request.get_json(silent=True) if request.is_json else {}
+        if not data and request.args:
+            data = request.args.to_dict()
+        return node.handle_set_initial_pose(data)
+
+    @app.route('/map_info', methods=['GET', 'OPTIONS'])
+    @app.route('/api/map_info', methods=['GET', 'OPTIONS'])
+    def get_map_info_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        return node.handle_map_info()
+
+    @app.route('/waypoints', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/api/waypoints', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/chain_goals', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/api/chain_goals', methods=['GET', 'POST', 'OPTIONS'])
+    def waypoints_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        if request.method == 'GET':
+            return node.handle_get_waypoints()
+        data = request.get_json(silent=True) if request.is_json else {}
+        if data and ('execute' in data or 'start' in data):
+            return node.handle_execute_waypoints(data)
+        if data and 'waypoints' in data:
+            return node.handle_set_waypoints(data)
+        return node.handle_get_waypoints()
+
+    @app.route('/waypoints/add', methods=['POST', 'OPTIONS'])
+    @app.route('/api/waypoints/add', methods=['POST', 'OPTIONS'])
+    def waypoints_add_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        data = request.get_json(silent=True) if request.is_json else {}
+        return node.handle_add_waypoint(data)
+
+    @app.route('/waypoints/add_current', methods=['POST', 'OPTIONS'])
+    @app.route('/api/waypoints/add_current', methods=['POST', 'OPTIONS'])
+    def waypoints_add_current_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        return node.handle_add_current_pose_waypoint()
+
+    @app.route('/waypoints/clear', methods=['POST', 'OPTIONS'])
+    @app.route('/api/waypoints/clear', methods=['POST', 'OPTIONS'])
+    def waypoints_clear_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        return node.handle_clear_waypoints()
+
+    @app.route('/waypoints/delete/<int:index>', methods=['POST', 'DELETE', 'OPTIONS'])
+    @app.route('/api/waypoints/delete/<int:index>', methods=['POST', 'DELETE', 'OPTIONS'])
+    @app.route('/waypoints/remove/<int:index>', methods=['POST', 'DELETE', 'OPTIONS'])
+    @app.route('/api/waypoints/remove/<int:index>', methods=['POST', 'DELETE', 'OPTIONS'])
+    def waypoints_delete_route(index):
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        return node.handle_delete_waypoint(index)
+
+    @app.route('/waypoints/execute', methods=['POST', 'OPTIONS'])
+    @app.route('/api/waypoints/execute', methods=['POST', 'OPTIONS'])
+    @app.route('/execute_waypoints', methods=['POST', 'OPTIONS'])
+    @app.route('/api/execute_waypoints', methods=['POST', 'OPTIONS'])
+    @app.route('/chain_goals/execute', methods=['POST', 'OPTIONS'])
+    @app.route('/api/chain_goals/execute', methods=['POST', 'OPTIONS'])
+    def waypoints_execute_route():
+        if request.method == 'OPTIONS':
+            return jsonify(ok=True), 200
+        data = request.get_json(silent=True) if request.is_json else {}
+        return node.handle_execute_waypoints(data)
+
+
     @sock.route('/ws/rover')
     def rover_ws(ws):
-        token = request.args.get('token', '')
-        if not token or not hmac.compare_digest(token, ROVER_TOKEN):
-            try:
-                ws.send(json.dumps({'error': 'Unauthorized', 'message': 'Valid token required in ?token= query parameter'}))
-                ws.close(1008, 'Unauthorized')
-            except Exception:
-                pass
-            return
+        if is_auth_required():
+            token = request.args.get('token', '')
+            if not token or not hmac.compare_digest(token, ROVER_TOKEN):
+                try:
+                    ws.send(json.dumps({'error': 'Unauthorized', 'message': 'Valid token required in ?token= query parameter'}))
+                    ws.close(1008, 'Unauthorized')
+                except Exception:
+                    pass
+                return
 
         conn = {'ws': ws, 'subs': set()}
         with connections_lock:

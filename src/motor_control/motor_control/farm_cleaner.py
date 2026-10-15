@@ -99,12 +99,16 @@ def kill_all_zombies():
         "encoder_odom_node",
         "robot_state_publisher",
         "rviz2",
-        "component_container_isolated"
+        "component_container_isolated",
+        "nav2_container",
+        "component_container"
     ]
     for target in exact_targets:
-        subprocess.run(["pkill", "-9", "-x", target], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-9", "-f", target], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     # Target only motor_control launch wrappers, never matching bare 'nav2'
     subprocess.run(["pkill", "-9", "-f", "ros2 launch motor_control"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    # Clear stale FastDDS shared memory segments and mutexes
+    subprocess.run("rm -f /dev/shm/fastrtps* /dev/shm/sem.fastrtps* >/dev/null 2>&1", shell=True)
     time.sleep(1.0)
 
 
