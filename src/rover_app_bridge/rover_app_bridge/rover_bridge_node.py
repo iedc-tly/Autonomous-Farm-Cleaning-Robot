@@ -358,9 +358,42 @@ class BridgeNode(Node):
         if dock is None:
             locs, _ = load_and_validate_locations()
             dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
-        if float(dock.get('x', 0.0)) < -1.35:
-            self.get_logger().warn(f"[BridgeNode] Saved dock X={dock.get('x')} is outside current map. Falling back to map origin (0, 0, 0).")
-            dock = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+
+        map_yaml = getattr(self.cleaner, 'map_yaml', os.path.join(robot_home(), 'my_map.yaml'))
+        if not os.path.exists(map_yaml):
+            self.get_logger().warn(f"[BridgeNode] Map {map_yaml} not found. Cannot verify dock pose extent.")
+            return
+
+        try:
+            with open(map_yaml, 'r') as f:
+                meta = yaml.safe_load(f)
+            from PIL import Image
+            img_rel = meta['image']
+            img_path = img_rel if img_rel.startswith('/') else os.path.join(os.path.dirname(map_yaml), img_rel)
+            if not os.path.exists(img_path):
+                self.get_logger().warn(f"[BridgeNode] Map image {img_path} not found.")
+                return
+            with Image.open(img_path) as img:
+                w, h = img.size
+            res = float(meta['resolution'])
+            ox = float(meta['origin'][0])
+            oy = float(meta['origin'][1])
+            xmin = ox
+            xmax = ox + w * res
+            ymin = oy
+            ymax = oy + h * res
+        except Exception as e:
+            self.get_logger().warn(f"[BridgeNode] Failed to read map extent from {map_yaml}: {e}")
+            return
+
+        dock_x = float(dock.get('x', 0.0))
+        dock_y = float(dock.get('y', 0.0))
+        if dock_x < xmin or dock_x > xmax or dock_y < ymin or dock_y > ymax:
+            self.get_logger().warn(
+                f"[BridgeNode] Dock pose ({dock_x:.2f}, {dock_y:.2f}) lies outside map extent "
+                f"[{xmin:.2f}, {xmax:.2f}, {ymin:.2f}, {ymax:.2f}]. Not publishing."
+            )
+            return
 
         p = PoseWithCovarianceStamped()
         p.header.frame_id = 'map'
@@ -529,12 +562,14 @@ class BridgeNode(Node):
 
     def auto_sweep_entire_room(self):
         """Auto-detect room bounds from saved map and set sweep to entire room."""
-        map_yaml = getattr(self.cleaner, 'map_yaml', '/home/iedctly/my_map.yaml')
+        map_yaml = getattr(self.cleaner, 'map_yaml', os.path.join(robot_home(), 'my_map.yaml'))
         if not os.path.exists(map_yaml):
             return None, f"Map file not found at {map_yaml}. Please run mapping first."
 
         from motor_control.farm_cleaner import get_entire_room_bounds
         bounds = get_entire_room_bounds(map_yaml, robot_radius=0.48)
+        if bounds is None:
+            return None, f"Failed to compute room bounds from map {map_yaml}."
         locs, _ = load_and_validate_locations()
         if not locs:
             locs = {
@@ -873,6 +908,9 @@ class BridgeNode(Node):
 
             sweep_cfg = locs['sweep']
             map_yaml = self.cleaner.map_yaml
+            if not os.path.exists(map_yaml):
+                return jsonify(ok=False, error=f"Map file not found: {map_yaml}"), 412
+
             waypoints = None
             if os.path.exists(SNAKE_WAYPOINTS_FILE):
                 try:
@@ -893,6 +931,8 @@ class BridgeNode(Node):
                 if abs(bounds[1] - bounds[0]) < 0.5 or abs(bounds[3] - bounds[2]) < 0.5:
                     from motor_control.farm_cleaner import get_entire_room_bounds
                     bounds = get_entire_room_bounds(map_yaml, robot_radius=0.48)
+                    if bounds is None:
+                        return jsonify(ok=False, error="Failed to detect room bounds from map"), 412
                     self.get_logger().info(f"[BridgeNode] Auto-expanded bounds to Entire Room: {bounds}")
 
                 radius = max(float(sweep_cfg.get('robot_radius', 0.48)), 0.48)

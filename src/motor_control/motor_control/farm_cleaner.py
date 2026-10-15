@@ -121,10 +121,10 @@ def yaw_to_quaternion(yaw: float) -> dict:
 def get_entire_room_bounds(map_yaml_file: str, robot_radius: float = 0.48) -> list:
     """
     Auto-detect the entire room's connected safe bounding box from map.
-    Returns [xmin, xmax, ymin, ymax]
+    Returns [xmin, xmax, ymin, ymax] or None on failure.
     """
     if not os.path.exists(map_yaml_file):
-        return [-5.99, 3.41, -4.12, 1.68]
+        return None
     try:
         from PIL import Image
         import numpy as np
@@ -133,6 +133,8 @@ def get_entire_room_bounds(map_yaml_file: str, robot_radius: float = 0.48) -> li
             meta = yaml.safe_load(f)
         img_rel = meta['image']
         img_path = img_rel if img_rel.startswith('/') else os.path.join(os.path.dirname(map_yaml_file), img_rel)
+        if not os.path.exists(img_path):
+            return None
         img = Image.open(img_path)
         grid = np.array(img)
         h, w = grid.shape
@@ -145,7 +147,7 @@ def get_entire_room_bounds(map_yaml_file: str, robot_radius: float = 0.48) -> li
 
         labeled, num_features = label(safe)
         if num_features == 0:
-            return [-5.99, 3.41, -4.12, 1.68]
+            return None
         component_sizes = [np.sum(labeled == i) for i in range(1, num_features + 1)]
         largest_comp_idx = np.argmax(component_sizes) + 1
         main_comp = (labeled == largest_comp_idx)
@@ -156,7 +158,7 @@ def get_entire_room_bounds(map_yaml_file: str, robot_radius: float = 0.48) -> li
         ymax = float(round(oy + (h - 1 - rows.min()) * res, 2))
         return [xmin, xmax, ymin, ymax]
     except Exception:
-        return [-5.99, 3.41, -4.12, 1.68]
+        return None
 
 
 def make_snake(map_yaml_file: str, bounds: list = None, row_gap: float = 0.4, step_x: float = 0.4, robot_radius: float = 0.48) -> list:
@@ -203,7 +205,11 @@ def make_snake(map_yaml_file: str, bounds: list = None, row_gap: float = 0.4, st
 
     # Free cells threshold: auto-detect connected room bounds if bounds is None or empty
     if bounds is None or len(bounds) != 4:
-        xmin, xmax, ymin, ymax = get_entire_room_bounds(map_yaml_file, robot_radius)
+        room_bounds = get_entire_room_bounds(map_yaml_file, robot_radius)
+        if room_bounds is None:
+            print(f"[SnakeFilter] Error: Could not detect room bounds from map {map_yaml_file}")
+            return []
+        xmin, xmax, ymin, ymax = room_bounds
         print(f"[SnakeFilter] No custom bounds provided. Auto-selected Entire Room bounds: X:[{xmin:.2f}, {xmax:.2f}], Y:[{ymin:.2f}, {ymax:.2f}]")
     else:
         b = [float(x) for x in bounds]
