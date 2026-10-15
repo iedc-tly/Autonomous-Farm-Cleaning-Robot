@@ -288,8 +288,7 @@ class BridgeNode(Node):
         self.get_logger().info(f'[Auth] ROVER_TOKEN active: {ROVER_TOKEN}')
 
         # Auto-bringup Nav2 and hardware drivers on boot if an existing map is available
-        default_map = os.path.join(robot_home(), 'my_map.yaml')
-        map_yaml = getattr(self.cleaner, 'map_yaml', default_map)
+        map_yaml = self.cleaner.map_yaml
         if os.path.exists(map_yaml):
             self.get_logger().info(f"[BridgeNode] Existing map found at {map_yaml}. Auto-starting Nav2 & hardware stack in background...")
             threading.Thread(target=self.ensure_nav2_active, daemon=True).start()
@@ -307,9 +306,7 @@ class BridgeNode(Node):
             return True
 
         self.get_logger().info("[BridgeNode] Nav2 navigation stack not active. Auto-bringing up Nav2...")
-        map_yaml = getattr(self.cleaner, 'map_yaml', '/home/iedctly/my_map.yaml')
-        if not os.path.exists(map_yaml):
-            map_yaml = "/home/iedctly/my_map.yaml"
+        map_yaml = self.cleaner.map_yaml
 
         if not os.path.exists(map_yaml):
             self.get_logger().error(f"[BridgeNode] Map file missing at {map_yaml}! Cannot bring up Nav2.")
@@ -359,7 +356,7 @@ class BridgeNode(Node):
             locs, _ = load_and_validate_locations()
             dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
 
-        map_yaml = getattr(self.cleaner, 'map_yaml', os.path.join(robot_home(), 'my_map.yaml'))
+        map_yaml = self.cleaner.map_yaml
         if not os.path.exists(map_yaml):
             self.get_logger().warn(f"[BridgeNode] Map {map_yaml} not found. Cannot verify dock pose extent.")
             return
@@ -479,7 +476,7 @@ class BridgeNode(Node):
         dx = abs(sweep.get('xmax', 0) - sweep.get('xmin', 0))
         dy = abs(sweep.get('ymax', 0) - sweep.get('ymin', 0))
         if dx >= 0.25 and dy >= 0.25:
-            map_yaml = getattr(self.cleaner, 'map_yaml', '/home/iedctly/my_map.yaml')
+            map_yaml = self.cleaner.map_yaml
             radius = max(float(sweep.get('robot_radius', 0.48)), 0.48)
             try:
                 wps = make_snake(
@@ -562,7 +559,7 @@ class BridgeNode(Node):
 
     def auto_sweep_entire_room(self):
         """Auto-detect room bounds from saved map and set sweep to entire room."""
-        map_yaml = getattr(self.cleaner, 'map_yaml', os.path.join(robot_home(), 'my_map.yaml'))
+        map_yaml = self.cleaner.map_yaml
         if not os.path.exists(map_yaml):
             return None, f"Map file not found at {map_yaml}. Please run mapping first."
 
