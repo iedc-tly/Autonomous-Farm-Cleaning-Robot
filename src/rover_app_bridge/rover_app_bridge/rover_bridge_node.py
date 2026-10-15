@@ -17,6 +17,9 @@ import math
 import time
 import threading
 import yaml
+import secrets
+import hmac
+import re
 
 import rclpy
 from rclpy.node import Node
@@ -40,6 +43,36 @@ def robot_home() -> str:
 LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/src/motor_control/config/locations.yaml")
 INSTALL_LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/install/motor_control/share/motor_control/config/locations.yaml")
 SNAKE_WAYPOINTS_FILE = os.path.join(robot_home(), "ros2_ws/snake_waypoints.yaml")
+
+
+def get_or_create_rover_token() -> str:
+    env_token = os.environ.get("ROVER_TOKEN")
+    if env_token:
+        return env_token.strip()
+
+    token_file = os.path.join(robot_home(), ".rover_token")
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, "r") as f:
+                token = f.read().strip()
+                if token:
+                    return token
+        except Exception:
+            pass
+
+    token = secrets.token_urlsafe(16)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        fd = os.open(token_file, flags, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(token + "\n")
+    except Exception as e:
+        print(f"[BridgeNode] Warning: failed to save token to {token_file}: {e}")
+    return token
+
+
+ROVER_TOKEN = get_or_create_rover_token()
 
 
 def _clamp(v, lo, hi):
@@ -246,9 +279,11 @@ class BridgeNode(Node):
             'diagnostic_ok': True,
         }
         self.get_logger().info('rover_bridge_node ready (App Bridge & Emergency Stop connected)!')
+        self.get_logger().info(f'[Auth] ROVER_TOKEN active: {ROVER_TOKEN}')
 
         # Auto-bringup Nav2 and hardware drivers on boot if an existing map is available
-        map_yaml = getattr(self.cleaner, 'map_yaml', '/home/iedctly/my_map.yaml')
+        default_map = os.path.join(robot_home(), 'my_map.yaml')
+        map_yaml = getattr(self.cleaner, 'map_yaml', default_map)
         if os.path.exists(map_yaml):
             self.get_logger().info(f"[BridgeNode] Existing map found at {map_yaml}. Auto-starting Nav2 & hardware stack in background...")
             threading.Thread(target=self.ensure_nav2_active, daemon=True).start()
@@ -579,6 +614,14 @@ class BridgeNode(Node):
             return jsonify(ok=False, error=str(e)), 500
 
     def handle_save_map(self, map_name: str = None):
+        if map_name is not None and str(map_name).strip() != "":
+            clean_name = str(map_name).strip()
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', clean_name):
+                return jsonify(ok=False, error="Invalid map_name: must match [A-Za-z0-9_-]{1,40}"), 400
+            map_name = clean_name
+        else:
+            map_name = None
+
         try:
             with self.lock:
                 if self.state != "MAPPING" and self.cleaner.slam is None:
@@ -1232,6 +1275,9 @@ def handle_message(node: BridgeNode, conn: dict, raw: str):
 
     if op == 'save_map':
         map_name = data.get('map_name')
+        if map_name and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', str(map_name)):
+            node.get_logger().warn(f"[BridgeNode WS] Invalid map_name rejected: {map_name}")
+            return
         node.handle_save_map(map_name=map_name)
         return
 
@@ -1259,6 +1305,9 @@ def handle_message(node: BridgeNode, conn: dict, raw: str):
 
     elif topic in ('/rover/save_map', '/map/save'):
         map_name = msg.get('map_name') if isinstance(msg, dict) else None
+        if map_name and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', str(map_name)):
+            node.get_logger().warn(f"[BridgeNode WS] Invalid map_name rejected: {map_name}")
+            return
         node.handle_save_map(map_name=map_name)
 
     elif topic in ('/rover/save_location', '/locations/save'):
@@ -1566,6 +1615,23 @@ def render_app_html() -> str:
 </div>
 
 <script>
+  let roverToken = localStorage.getItem('rover_token') || '';
+  if (!roverToken) {
+    const inputToken = prompt('Enter Rover Access Token (X-Rover-Token):');
+    if (inputToken) {
+      roverToken = inputToken.trim();
+      localStorage.setItem('rover_token', roverToken);
+    }
+  }
+
+  function authHeaders(custom = {}) {
+    const h = { ...custom };
+    if (roverToken) {
+      h['X-Rover-Token'] = roverToken;
+    }
+    return h;
+  }
+
   const logBox = document.getElementById('logBox');
   const wsBadge = document.getElementById('wsBadge');
   const stateBadge = document.getElementById('stateBadge');
@@ -1592,7 +1658,7 @@ def render_app_html() -> str:
       log(`Calling ${endpoint}...`);
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: body ? JSON.stringify(body) : undefined
       });
       const data = await res.json();
@@ -1608,7 +1674,7 @@ def render_app_html() -> str:
   function drive(direction) {
     fetch('/api/cmd_vel', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ direction: direction, speed_scale: parseFloat(speedSlider.value) })
     }).catch(() => {});
   }
@@ -1670,7 +1736,7 @@ def render_app_html() -> str:
 
   document.getElementById('btnRefreshMap').addEventListener('click', () => {
     mapImg.style.display = 'block';
-    mapImg.src = '/map_image?t=' + Date.now();
+    mapImg.src = '/map_image?token=' + encodeURIComponent(roverToken) + '&t=' + Date.now();
   });
 
   function updatePoseUI(p) {
@@ -1702,10 +1768,10 @@ def render_app_html() -> str:
     if (!locs) return;
     let html = '';
     if (locs.dock) {
-      html += `⚓ Dock: X: ${locs.dock.x?.toFixed(2)}m, Y: ${locs.dock.y?.toFixed(2)}m, Yaw: ${(locs.dock.yaw * 180 / Math.PI).toFixed(1)}°\\n`;
+      html += `⚓ Dock: X: ${locs.dock.x?.toFixed(2)}m, Y: ${locs.dock.y?.toFixed(2)}m, Yaw: ${(locs.dock.yaw * 180 / Math.PI).toFixed(1)}°\n`;
     }
     if (locs.pit) {
-      html += `🗑️ Pit:  X: ${locs.pit.x?.toFixed(2)}m, Y: ${locs.pit.y?.toFixed(2)}m, Yaw: ${(locs.pit.yaw * 180 / Math.PI).toFixed(1)}°\\n`;
+      html += `🗑️ Pit:  X: ${locs.pit.x?.toFixed(2)}m, Y: ${locs.pit.y?.toFixed(2)}m, Yaw: ${(locs.pit.yaw * 180 / Math.PI).toFixed(1)}°\n`;
     }
     if (locs.sweep) {
       html += `🧹 Sweep Bounds: X:[${locs.sweep.xmin?.toFixed(2)}..${locs.sweep.xmax?.toFixed(2)}], Y:[${locs.sweep.ymin?.toFixed(2)}..${locs.sweep.ymax?.toFixed(2)}]`;
@@ -1715,7 +1781,7 @@ def render_app_html() -> str:
 
   async function fetchStatus() {
     try {
-      const res = await fetch('/api/status');
+      const res = await fetch('/api/status', { headers: authHeaders() });
       const st = await res.json();
       updateStateUI(st);
     } catch (_) {}
@@ -1723,7 +1789,7 @@ def render_app_html() -> str:
 
   async function fetchLocations() {
     try {
-      const res = await fetch('/api/locations');
+      const res = await fetch('/api/locations', { headers: authHeaders() });
       const locs = await res.json();
       updateLocsUI(locs);
     } catch (_) {}
@@ -1732,7 +1798,8 @@ def render_app_html() -> str:
   let ws = null;
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws/rover`);
+    const wsUrl = `${proto}//${location.host}/ws/rover?token=${encodeURIComponent(roverToken)}`;
+    ws = new WebSocket(wsUrl);
     ws.onopen = () => {
       wsBadge.textContent = 'ONLINE';
       wsBadge.className = 'badge green';
@@ -1769,11 +1836,38 @@ def make_flask_app(node: BridgeNode) -> Flask:
     app.url_map.strict_slashes = False
     sock = Sock(app)
 
+    @app.before_request
+    def authenticate_request():
+        if request.method == 'OPTIONS':
+            return None
+        public_paths = {'/', '/app', '/index.html', '/health', '/api/health'}
+        if request.method == 'GET' and request.path in public_paths:
+            return None
+
+        # Check X-Rover-Token or Authorization header
+        token = request.headers.get('X-Rover-Token')
+        if not token:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:].strip()
+            elif auth_header:
+                token = auth_header.strip()
+        if not token and request.method == 'GET' and request.path in ('/map_image', '/api/map_image'):
+            token = request.args.get('token')
+
+        if not token or not hmac.compare_digest(token, ROVER_TOKEN):
+            return jsonify(error="Unauthorized", message="Valid X-Rover-Token or Authorization header required"), 401
+
     @app.after_request
     def add_cors_headers(response):
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
-        response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+        allowed_origins = os.environ.get("ROVER_ALLOWED_ORIGINS", "").strip()
+        if allowed_origins:
+            origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
+            req_origin = request.headers.get("Origin")
+            if req_origin and req_origin in origins:
+                response.headers['Access-Control-Allow-Origin'] = req_origin
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-Rover-Token'
+                response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
         return response
 
     @app.errorhandler(404)
@@ -1828,8 +1922,8 @@ def make_flask_app(node: BridgeNode) -> Flask:
             return jsonify(error=err), 412
         return jsonify(data), 200
 
-    @app.route('/locations/save_current', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_current', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/save_current', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_current', methods=['POST', 'OPTIONS'])
     def post_save_current():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
@@ -1837,52 +1931,52 @@ def make_flask_app(node: BridgeNode) -> Flask:
         loc_type = data.get('name') or data.get('location') or request.args.get('name') or request.args.get('location') or 'dock'
         return node.handle_save_location(loc_type, data)
 
-    @app.route('/locations/save_dock', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_dock', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/save_dock', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/save_dock', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/save_dock', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_dock', methods=['POST', 'OPTIONS'])
+    @app.route('/save_dock', methods=['POST', 'OPTIONS'])
+    @app.route('/api/save_dock', methods=['POST', 'OPTIONS'])
     def post_save_dock():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
         data = request.get_json(silent=True) if request.is_json else {}
         return node.handle_save_location('dock', data)
 
-    @app.route('/locations/save_pit', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_pit', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/save_pit', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/save_pit', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/save_pit', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_pit', methods=['POST', 'OPTIONS'])
+    @app.route('/save_pit', methods=['POST', 'OPTIONS'])
+    @app.route('/api/save_pit', methods=['POST', 'OPTIONS'])
     def post_save_pit():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
         data = request.get_json(silent=True) if request.is_json else {}
         return node.handle_save_location('pit', data)
 
-    @app.route('/locations/save_sweep_corner1', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_sweep_corner1', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/save_sweep_corner1', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/save_sweep_corner1', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/locations/save_sweep_bl', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_sweep_bl', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/save_sweep_corner1', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_sweep_corner1', methods=['POST', 'OPTIONS'])
+    @app.route('/save_sweep_corner1', methods=['POST', 'OPTIONS'])
+    @app.route('/api/save_sweep_corner1', methods=['POST', 'OPTIONS'])
+    @app.route('/locations/save_sweep_bl', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_sweep_bl', methods=['POST', 'OPTIONS'])
     def post_save_sweep_corner1():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
         data = request.get_json(silent=True) if request.is_json else {}
         return node.handle_save_location('sweep_corner1', data)
 
-    @app.route('/locations/save_sweep_corner2', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_sweep_corner2', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/save_sweep_corner2', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/save_sweep_corner2', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/locations/save_sweep_tr', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/save_sweep_tr', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/save_sweep_corner2', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_sweep_corner2', methods=['POST', 'OPTIONS'])
+    @app.route('/save_sweep_corner2', methods=['POST', 'OPTIONS'])
+    @app.route('/api/save_sweep_corner2', methods=['POST', 'OPTIONS'])
+    @app.route('/locations/save_sweep_tr', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/save_sweep_tr', methods=['POST', 'OPTIONS'])
     def post_save_sweep_corner2():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
         data = request.get_json(silent=True) if request.is_json else {}
         return node.handle_save_location('sweep_corner2', data)
 
-    @app.route('/locations/auto_sweep_room', methods=['POST', 'GET', 'OPTIONS'])
-    @app.route('/api/locations/auto_sweep_room', methods=['POST', 'GET', 'OPTIONS'])
+    @app.route('/locations/auto_sweep_room', methods=['POST', 'OPTIONS'])
+    @app.route('/api/locations/auto_sweep_room', methods=['POST', 'OPTIONS'])
     def post_auto_sweep_room():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
@@ -1915,23 +2009,23 @@ def make_flask_app(node: BridgeNode) -> Flask:
     def post_sweep():
         return node.handle_sweep_request()
 
-    # Manual driving velocity commands (HTTP POST & GET across all route aliases)
-    @app.route('/cmd_vel', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/cmd_vel', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/cmdvel', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/cmdvel', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/drive', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/drive', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/teleop', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/teleop', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/manual', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/manual', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/move', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/move', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/control', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/control', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/rover/cmd_vel', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/rover/cmd_vel', methods=['GET', 'POST', 'OPTIONS'])
+    # Manual driving velocity commands (HTTP POST across all route aliases)
+    @app.route('/cmd_vel', methods=['POST', 'OPTIONS'])
+    @app.route('/api/cmd_vel', methods=['POST', 'OPTIONS'])
+    @app.route('/cmdvel', methods=['POST', 'OPTIONS'])
+    @app.route('/api/cmdvel', methods=['POST', 'OPTIONS'])
+    @app.route('/drive', methods=['POST', 'OPTIONS'])
+    @app.route('/api/drive', methods=['POST', 'OPTIONS'])
+    @app.route('/teleop', methods=['POST', 'OPTIONS'])
+    @app.route('/api/teleop', methods=['POST', 'OPTIONS'])
+    @app.route('/manual', methods=['POST', 'OPTIONS'])
+    @app.route('/api/manual', methods=['POST', 'OPTIONS'])
+    @app.route('/move', methods=['POST', 'OPTIONS'])
+    @app.route('/api/move', methods=['POST', 'OPTIONS'])
+    @app.route('/control', methods=['POST', 'OPTIONS'])
+    @app.route('/api/control', methods=['POST', 'OPTIONS'])
+    @app.route('/rover/cmd_vel', methods=['POST', 'OPTIONS'])
+    @app.route('/api/rover/cmd_vel', methods=['POST', 'OPTIONS'])
     def post_cmd_vel():
         try:
             if request.method == 'OPTIONS':
@@ -2009,9 +2103,9 @@ def make_flask_app(node: BridgeNode) -> Flask:
         except Exception as e:
             return jsonify(ok=False, error=str(e)), 500
 
-    @app.route('/align_map', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/align_map', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/sharpen_pose', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/align_map', methods=['POST', 'OPTIONS'])
+    @app.route('/api/align_map', methods=['POST', 'OPTIONS'])
+    @app.route('/api/sharpen_pose', methods=['POST', 'OPTIONS'])
     def align_map_route():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
@@ -2024,19 +2118,19 @@ def make_flask_app(node: BridgeNode) -> Flask:
         except Exception as e:
             return jsonify(ok=False, error=str(e)), 500
 
-    @app.route('/start_mapping', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/start_mapping', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/mapping/start', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/mapping/start', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/start_mapping', methods=['POST', 'OPTIONS'])
+    @app.route('/api/start_mapping', methods=['POST', 'OPTIONS'])
+    @app.route('/mapping/start', methods=['POST', 'OPTIONS'])
+    @app.route('/api/mapping/start', methods=['POST', 'OPTIONS'])
     def start_mapping_route():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
         return node.handle_start_mapping()
 
-    @app.route('/save_map', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/save_map', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/map/save', methods=['GET', 'POST', 'OPTIONS'])
-    @app.route('/api/map/save', methods=['GET', 'POST', 'OPTIONS'])
+    @app.route('/save_map', methods=['POST', 'OPTIONS'])
+    @app.route('/api/save_map', methods=['POST', 'OPTIONS'])
+    @app.route('/map/save', methods=['POST', 'OPTIONS'])
+    @app.route('/api/map/save', methods=['POST', 'OPTIONS'])
     def save_map_route():
         if request.method == 'OPTIONS':
             return jsonify(ok=True), 200
@@ -2058,6 +2152,15 @@ def make_flask_app(node: BridgeNode) -> Flask:
 
     @sock.route('/ws/rover')
     def rover_ws(ws):
+        token = request.args.get('token', '')
+        if not token or not hmac.compare_digest(token, ROVER_TOKEN):
+            try:
+                ws.send(json.dumps({'error': 'Unauthorized', 'message': 'Valid token required in ?token= query parameter'}))
+                ws.close(1008, 'Unauthorized')
+            except Exception:
+                pass
+            return
+
         conn = {'ws': ws, 'subs': set()}
         with connections_lock:
             connections.append(conn)
