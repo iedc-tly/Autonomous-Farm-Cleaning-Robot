@@ -80,6 +80,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'invert_all': True,
+            'use_imu': False,
         }],
     )
 

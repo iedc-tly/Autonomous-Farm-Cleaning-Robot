@@ -21,9 +21,14 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def robot_home() -> str:
+    return os.path.abspath(os.environ.get("ROBOT_HOME", os.path.expanduser("~")))
+
+
 def generate_launch_description():
+    default_map_path = os.path.join(robot_home(), 'my_map.yaml')
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
-    map_yaml_file = LaunchConfiguration('map', default='/home/iedctly/my_map.yaml')
+    map_yaml_file = LaunchConfiguration('map', default=default_map_path)
 
     # Nav2 configuration params
     nav2_params_file = LaunchConfiguration(
@@ -63,21 +68,6 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ---- mpu9150_node (IMU driver) ----
-    mpu9150_node = Node(
-        package='motor_control',
-        executable='mpu9150_node',
-        name='mpu9150_node',
-        output='screen',
-        parameters=[{
-            'i2c_bus': 1,
-            'device_address': 0x68,
-            'frame_id': 'imu_link',
-            'publish_rate': 50.0,
-            'calibrate_samples': 200,
-        }],
-    )
-
     # ---- encoder_odom_node ----
     encoder_odom_node = Node(
         package='motor_control',
@@ -86,7 +76,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'invert_all': True,
-            'use_imu': True,
+            'use_imu': False,
         }],
     )
 
@@ -132,7 +122,7 @@ def generate_launch_description():
             description='Use simulation clock if true'
         ),
         DeclareLaunchArgument(
-            'map', default_value='/home/iedctly/my_map.yaml',
+            'map', default_value=default_map_path,
             description='Full path to map yaml file to load'
         ),
         DeclareLaunchArgument(
@@ -145,7 +135,6 @@ def generate_launch_description():
         ),
         robot_state_publisher_node,
         motor_node,
-        mpu9150_node,
         encoder_odom_node,
         rplidar_launch,
         nav2_launch,

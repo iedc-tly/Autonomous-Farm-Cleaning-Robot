@@ -100,7 +100,7 @@ class EncoderOdomNode(Node):
         self.declare_parameter("invert_angular", False)
 
         # IMU fusion parameters
-        self.declare_parameter("use_imu", True)
+        self.declare_parameter("use_imu", False)
         self.declare_parameter("imu_topic", "/imu/data")
         self.declare_parameter("publish_tf", True)
 
@@ -141,7 +141,7 @@ class EncoderOdomNode(Node):
         if not self.imu_fused:
             self.imu_fused = True
             self.get_logger().info(
-                "MPU-9150 IMU stream connected! Fusing gyro yaw rate with wheel odometry."
+                "IMU stream connected! Fusing gyro yaw rate with wheel odometry."
             )
 
     def _get_wheel_multiplier(self, name: str) -> float:
