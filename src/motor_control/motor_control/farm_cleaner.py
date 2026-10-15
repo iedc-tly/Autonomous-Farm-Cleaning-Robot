@@ -22,6 +22,7 @@ import time
 import signal
 import subprocess
 import threading
+import shlex
 from enum import Enum
 import yaml
 import numpy as np
@@ -33,6 +34,10 @@ from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 
+def robot_home() -> str:
+    return os.path.abspath(os.environ.get("ROBOT_HOME", os.path.expanduser("~")))
+
+
 class S(Enum):
     IDLE = 0
     MAPPING = 1
@@ -41,11 +46,19 @@ class S(Enum):
     DONE = 4
 
 
-def launch(cmd: str) -> subprocess.Popen:
+def launch(cmd) -> subprocess.Popen:
     """Launch process in its own session group for clean kill later."""
-    print(f"[BossNode] Launching process group: {cmd}")
-    bash_cmd = f"bash -c 'source /opt/ros/humble/setup.bash; [ -f /home/iedctly/ros2_ws/install/setup.bash ] && source /home/iedctly/ros2_ws/install/setup.bash; export ROS_LOG_DIR=/tmp; exec {cmd}'"
-    return subprocess.Popen(bash_cmd, shell=True, start_new_session=True)
+    if isinstance(cmd, (list, tuple)):
+        cmd_str = " ".join(shlex.quote(str(arg)) for arg in cmd)
+    else:
+        cmd_str = str(cmd)
+    print(f"[BossNode] Launching process group: {cmd_str}")
+    install_setup = os.path.join(robot_home(), "ros2_ws/install/setup.bash")
+    bash_cmd = [
+        "bash", "-c",
+        f'source /opt/ros/humble/setup.bash; [ -f {shlex.quote(install_setup)} ] && source {shlex.quote(install_setup)}; export ROS_LOG_DIR=/tmp; exec {cmd_str}'
+    ]
+    return subprocess.Popen(bash_cmd, start_new_session=True)
 
 
 def stop(p: subprocess.Popen, timeout: float = 10.0):
@@ -72,11 +85,9 @@ def stop(p: subprocess.Popen, timeout: float = 10.0):
 
 
 def kill_all_zombies():
-    """Kill any zombie nodes that might conflict over serial ports or TFs."""
-    targets = [
+    """Kill any zombie nodes that might conflict over serial ports or TFs using exact process names."""
+    exact_targets = [
         "async_slam_toolbox_node",
-        "slam_toolbox",
-        "nav2",
         "amcl",
         "map_server",
         "planner_server",
@@ -87,10 +98,13 @@ def kill_all_zombies():
         "motor_node",
         "encoder_odom_node",
         "robot_state_publisher",
-        "rviz2"
+        "rviz2",
+        "component_container_isolated"
     ]
-    for target in targets:
-        subprocess.run(f"pkill -9 -f {target}", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    for target in exact_targets:
+        subprocess.run(["pkill", "-9", "-x", target], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    # Target only motor_control launch wrappers, never matching bare 'nav2'
+    subprocess.run(["pkill", "-9", "-f", "ros2 launch motor_control"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     time.sleep(1.0)
 
 
@@ -357,8 +371,10 @@ class Cleaner:
     Boss Orchestrator Class managing state transitions and ROS 2 process bringup/shutdown.
     """
 
-    def __init__(self, map_path: str = "/home/iedctly/my_map"):
+    def __init__(self, map_path: str = None):
         self.state = S.IDLE
+        if map_path is None:
+            map_path = os.path.join(robot_home(), "my_map")
         self.map_prefix = map_path
         self.map_yaml = f"{map_path}.yaml"
 
@@ -393,14 +409,20 @@ class Cleaner:
     def save_map(self, map_name: str = None) -> bool:
         with self.lock:
             if map_name:
-                self.map_prefix = map_name if map_name.startswith('/') else os.path.join("/home/iedctly", map_name)
+                self.map_prefix = map_name if map_name.startswith('/') else os.path.join(robot_home(), map_name)
                 self.map_yaml = f"{self.map_prefix}.yaml"
 
             print(f"[Cleaner] Saving map to {self.map_prefix} and transitioning to MAP_SAVED...")
-            cmd = f"bash -c 'source /opt/ros/humble/setup.bash; [ -f /home/iedctly/ros2_ws/install/setup.bash ] && source /home/iedctly/ros2_ws/install/setup.bash; export ROS_LOG_DIR=/tmp; exec ros2 run nav2_map_server map_saver_cli -f {self.map_prefix} --ros-args --remap map:=/map'"
+            install_setup = os.path.join(robot_home(), "ros2_ws/install/setup.bash")
+            bash_script = (
+                f'source /opt/ros/humble/setup.bash; '
+                f'[ -f {shlex.quote(install_setup)} ] && source {shlex.quote(install_setup)}; '
+                f'export ROS_LOG_DIR=/tmp; '
+                f'exec ros2 run nav2_map_server map_saver_cli -f {shlex.quote(self.map_prefix)} --ros-args --remap map:=/map'
+            )
             ret = -1
             try:
-                res = subprocess.run(cmd, shell=True, timeout=30)
+                res = subprocess.run(["bash", "-c", bash_script], timeout=30)
                 ret = res.returncode
             except Exception as e:
                 print(f"[Cleaner] Exception running map_saver_cli: {e}")
@@ -410,7 +432,7 @@ class Cleaner:
                 self.slam = None
 
             kill_all_zombies()
-            subprocess.run("rm -f *.posegraph *.data /tmp/*.posegraph /tmp/*.data", shell=True)
+            # Dropped dangerous rm -f *.posegraph *.data /tmp/*.posegraph /tmp/*.data cleanup
 
             if (ret == 0 and os.path.exists(self.map_yaml)) or (os.path.exists(self.map_yaml) and os.path.getmtime(self.map_yaml) > (time.time() - 35)):
                 print(f"[Cleaner] Map saved successfully: {self.map_yaml}")
@@ -466,8 +488,8 @@ class Cleaner:
             # Load saved dock pose from locations.yaml (or default 0,0,0)
             dock_x, dock_y, dock_yaw = 0.0, 0.0, 0.0
             loc_candidates = [
-                "/home/iedctly/ros2_ws/src/motor_control/config/locations.yaml",
-                "/home/iedctly/ros2_ws/install/motor_control/share/motor_control/config/locations.yaml"
+                os.path.join(robot_home(), "ros2_ws/src/motor_control/config/locations.yaml"),
+                os.path.join(robot_home(), "ros2_ws/install/motor_control/share/motor_control/config/locations.yaml")
             ]
             for lc in loc_candidates:
                 if os.path.exists(lc):
@@ -553,8 +575,8 @@ class Cleaner:
                 print("[Cleaner] Sweep finished successfully! All waypoints reached.")
                 # Autonomously navigate to Pit location
                 loc_candidates = [
-                    "/home/iedctly/ros2_ws/src/motor_control/config/locations.yaml",
-                    "/home/iedctly/ros2_ws/install/motor_control/share/motor_control/config/locations.yaml"
+                    os.path.join(robot_home(), "ros2_ws/src/motor_control/config/locations.yaml"),
+                    os.path.join(robot_home(), "ros2_ws/install/motor_control/share/motor_control/config/locations.yaml")
                 ]
                 pit_pose = None
                 for lc in loc_candidates:
