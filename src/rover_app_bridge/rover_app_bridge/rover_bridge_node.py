@@ -249,6 +249,12 @@ class BridgeNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.lifecycle_clients = {}
+        self.corrector = None
+        try:
+            from motor_control.pose_corrector import AutonomousPoseCorrector
+            self.corrector = AutonomousPoseCorrector(parent_node=self)
+        except Exception as e:
+            self.get_logger().warn(f"[BridgeNode] Pose corrector not initialized: {e}")
 
         self.lock = threading.Lock()
 
@@ -377,7 +383,7 @@ class BridgeNode(Node):
         # Trigger stationary AMCL scan-matching sharpening burst in background thread
         threading.Thread(target=self.sharpen_pose_stationary, daemon=True).start()
 
-    def sharpen_pose_stationary(self, num_updates: int = 10):
+    def sharpen_pose_stationary(self, num_updates: int = 2):
         """Burst no-motion updates to AMCL to snap live LiDAR scan directly to map walls while stationary."""
         from std_srvs.srv import Empty as EmptySrv
         if not hasattr(self, 'nomotion_client') or self.nomotion_client is None:
@@ -394,7 +400,7 @@ class BridgeNode(Node):
                 self.nomotion_client.call_async(EmptySrv.Request())
             except Exception:
                 pass
-            time.sleep(0.12)
+            time.sleep(0.3)
         self.get_logger().info("[BridgeNode] Pose sharpening complete. Live scan aligned with map.")
         return True
 
@@ -1101,18 +1107,14 @@ class BridgeNode(Node):
             self.current_goal_handle = future_goal.result()
             self.get_logger().info("[BridgeNode] Sweep goal accepted by Nav2!")
 
-            # 2D pose self-corrector sharing parent_node (BridgeNode) to prevent context corruption
-            corrector = None
-            try:
-                from motor_control.pose_corrector import AutonomousPoseCorrector
-                corrector = AutonomousPoseCorrector(parent_node=self)
-                corrector.sharpen_pose(timeout_sec=0.1)
-            except Exception as e:
-                self.get_logger().warn(f"Pose corrector note: {e}")
+            # Stationary 2D pose sharpening before moving
+            if self.corrector:
+                try:
+                    self.corrector.sharpen_pose(timeout_sec=0.1)
+                except Exception as e:
+                    self.get_logger().warn(f"Pose corrector note: {e}")
 
             future_res = self.current_goal_handle.get_result_async()
-            last_wp_idx = -1
-            last_sharpen_time = time.time()
 
             while not future_res.done():
                 with self.lock:
@@ -1123,18 +1125,6 @@ class BridgeNode(Node):
                         except Exception:
                             pass
                         break
-
-                if corrector:
-                    cw = self.waypoint_index
-                    now_t = time.time()
-                    if cw != last_wp_idx:
-                        last_wp_idx = cw
-                        last_sharpen_time = now_t
-                        corrector.sharpen_pose(timeout_sec=0.05)
-                    elif (now_t - last_sharpen_time) > 3.0:
-                        # Periodic AMCL particle sharpening during long straight lines
-                        last_sharpen_time = now_t
-                        corrector.sharpen_pose(timeout_sec=0.05)
 
                 time.sleep(0.1)
 
