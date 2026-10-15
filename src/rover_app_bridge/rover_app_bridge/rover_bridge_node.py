@@ -253,7 +253,7 @@ class BridgeNode(Node):
         self.lock = threading.Lock()
 
         # State Machine Fields
-        self.state = "IDLE"  # IDLE | SWEEPING | DOCKING | GOING_TO_PIT
+        self.state = "IDLE"  # IDLE | SWEEPING | DOCKING | GOING_TO_PIT | NAVIGATING_TO_PIT | MAPPING
         self.task = None      # sweep | dock | pit | None
         self.percent = 0.0
         self.waypoint_index = 0
@@ -574,7 +574,7 @@ class BridgeNode(Node):
             with self.lock:
                 if self.status.get('e_stop', False):
                     return jsonify(ok=False, error="e_stop_active"), 403
-                if self.state in ("SWEEPING", "DOCKING", "GOING_TO_PIT"):
+                if self.state in ("SWEEPING", "DOCKING", "GOING_TO_PIT", "NAVIGATING_TO_PIT"):
                     self.cancel_requested = True
                     if self.current_goal_handle:
                         try:
@@ -740,34 +740,47 @@ class BridgeNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error cancelling cleaner task: {e}")
 
+    def _try_begin(self, state: str, task: str, total: int) -> tuple[bool, str | None]:
+        """Atomically verify e_stop and IDLE state, then transition to the new state."""
+        with self.lock:
+            if self.status.get('e_stop', False):
+                return False, "e_stop_active"
+            if self.state != "IDLE":
+                return False, "busy"
+            self.state = state
+            self.task = task
+            self.last_task = None
+            self.last_result = None
+            self.error = None
+            self.percent = 0.0
+            self.waypoint_index = 0
+            self.waypoint_total = total
+            self.cancel_requested = False
+            return True, None
+
     def handle_dock_request(self):
         try:
-            with self.lock:
-                if self.status.get('e_stop', False):
-                    return jsonify(error="e_stop_active"), 403
-                if self.state != "IDLE":
-                    return jsonify(error="busy"), 409
-
             locs, err = load_and_validate_locations()
             if err:
                 return jsonify(error=err), 412
 
-            with self.lock:
-                self.state = "DOCKING"
-                self.task = "dock"
-                self.last_task = None
-                self.last_result = None
-                self.error = None
-                self.percent = 0.0
-                self.waypoint_index = 0
-                self.waypoint_total = 1
-                self.cancel_requested = False
+            ok, err_code = self._try_begin("DOCKING", "dock", 1)
+            if not ok:
+                if err_code == "e_stop_active":
+                    return jsonify(error="e_stop_active"), 403
+                return jsonify(error="busy"), 409
 
-            threading.Thread(
-                target=self._run_goto_pose,
-                args=("dock", locs['dock']),
-                daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._run_goto_pose,
+                    args=("dock", locs['dock']),
+                    daemon=True
+                ).start()
+            except Exception:
+                with self.lock:
+                    self.state = "IDLE"
+                    self.task = None
+                raise
 
             return jsonify(accepted=True, waypoint_total=1), 202
         except Exception as e:
@@ -776,32 +789,27 @@ class BridgeNode(Node):
 
     def handle_pit_request(self):
         try:
-            with self.lock:
-                if self.status.get('e_stop', False):
-                    return jsonify(error="e_stop_active"), 403
-                if self.state != "IDLE":
-                    return jsonify(error="busy"), 409
-
             locs, err = load_and_validate_locations()
             if err:
                 return jsonify(error=err), 412
 
-            with self.lock:
-                self.state = "GOING_TO_PIT"
-                self.task = "pit"
-                self.last_task = None
-                self.last_result = None
-                self.error = None
-                self.percent = 0.0
-                self.waypoint_index = 0
-                self.waypoint_total = 1
-                self.cancel_requested = False
+            ok, err_code = self._try_begin("GOING_TO_PIT", "pit", 1)
+            if not ok:
+                if err_code == "e_stop_active":
+                    return jsonify(error="e_stop_active"), 403
+                return jsonify(error="busy"), 409
 
-            threading.Thread(
-                target=self._run_goto_pose,
-                args=("pit", locs['pit']),
-                daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._run_goto_pose,
+                    args=("pit", locs['pit']),
+                    daemon=True
+                ).start()
+            except Exception:
+                with self.lock:
+                    self.state = "IDLE"
+                    self.task = None
+                raise
 
             return jsonify(accepted=True, waypoint_total=1), 202
         except Exception as e:
@@ -850,18 +858,12 @@ class BridgeNode(Node):
 
     def handle_sweep_request(self):
         try:
-            with self.lock:
-                if self.status.get('e_stop', False):
-                    return jsonify(error="e_stop_active"), 403
-                if self.state != "IDLE":
-                    return jsonify(error="busy"), 409
-
             locs, err = load_and_validate_locations()
             if err:
                 return jsonify(error=err), 412
 
             sweep_cfg = locs['sweep']
-            map_yaml = "/home/iedctly/my_map.yaml"
+            map_yaml = self.cleaner.map_yaml
             waypoints = None
             if os.path.exists(SNAKE_WAYPOINTS_FILE):
                 try:
@@ -904,22 +906,23 @@ class BridgeNode(Node):
                 self.get_logger().error("[BridgeNode] Failed to generate waypoints: area out of map range or blocked by obstacles!")
                 return jsonify(ok=False, error="Sweep area is out of map range or blocked by obstacles. Please reconfigure bounds in configure_locations.sh"), 412
 
-            with self.lock:
-                self.state = "SWEEPING"
-                self.task = "sweep"
-                self.last_task = None
-                self.last_result = None
-                self.error = None
-                self.percent = 0.0
-                self.waypoint_index = 0
-                self.waypoint_total = len(waypoints)
-                self.cancel_requested = False
+            ok, err_code = self._try_begin("SWEEPING", "sweep", len(waypoints))
+            if not ok:
+                if err_code == "e_stop_active":
+                    return jsonify(error="e_stop_active"), 403
+                return jsonify(error="busy"), 409
 
-            threading.Thread(
-                target=self._run_sweep,
-                args=(waypoints,),
-                daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._run_sweep,
+                    args=(waypoints,),
+                    daemon=True
+                ).start()
+            except Exception:
+                with self.lock:
+                    self.state = "IDLE"
+                    self.task = None
+                raise
 
             return jsonify(accepted=True, waypoints=len(waypoints)), 202
         except Exception as e:
@@ -1293,7 +1296,7 @@ def handle_message(node: BridgeNode, conn: dict, raw: str):
     msg = data.get('msg') or {}
 
     if topic in ('/cmd_vel', '/api/cmd_vel', '/drive', '/api/drive', '/teleop', '/api/teleop'):
-        if node.status.get('e_stop', False) or (node.state != "IDLE" and node.state != "MAPPING"):
+        if node.status.get('e_stop', False) or (node.state != "IDLE" and node.state != "MAPPING") or node.state in ("SWEEPING", "DOCKING", "GOING_TO_PIT", "NAVIGATING_TO_PIT"):
             node.publish_twist(0.0, 0.0)
             return
 
@@ -1756,7 +1759,7 @@ def render_app_html() -> str:
       stateBadge.classList.add('red');
     } else if (s === 'MAPPING') {
       stateBadge.classList.add('amber');
-    } else if (s === 'SWEEPING' || s === 'DOCKING' || s === 'GOING_TO_PIT') {
+    } else if (s === 'SWEEPING' || s === 'DOCKING' || s === 'GOING_TO_PIT' || s === 'NAVIGATING_TO_PIT') {
       stateBadge.classList.add('blue');
     } else {
       stateBadge.classList.add('green');
