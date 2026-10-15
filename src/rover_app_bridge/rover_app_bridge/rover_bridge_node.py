@@ -1779,19 +1779,6 @@ def make_flask_app(node: BridgeNode) -> Flask:
     @app.errorhandler(404)
     def page_not_found(e):
         node.get_logger().warn(f"\033[1;33m[BridgeNode 404]\033[0m Request to unknown route: {request.method} {request.path}")
-        path_lower = request.path.lower()
-        if any(k in path_lower for k in ('cmd', 'vel', 'drive', 'move', 'teleop', 'control', 'dir', 'nav', 'steer')):
-            node.get_logger().info(f"[BridgeNode Fallback] Auto-routing unrecognized motion endpoint '{request.path}' to cmd_vel!")
-            data = {}
-            if request.is_json:
-                data.update(request.get_json(silent=True) or {})
-            if request.args:
-                data.update(request.args.to_dict())
-            if request.form:
-                data.update(request.form.to_dict())
-            linear_x, angular_z = parse_twist_payload(data, speed_scale=node.status.get('speed_scale', 1.0))
-            node.publish_twist(linear_x, angular_z)
-            return jsonify(ok=True, linear_x=linear_x, angular_z=angular_z, notice="auto_routed_motion_fallback"), 200
         return jsonify(error="Not Found", path=request.path, method=request.method), 404
 
     @app.route('/health', methods=['GET'])
