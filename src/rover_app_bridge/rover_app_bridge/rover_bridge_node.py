@@ -33,9 +33,13 @@ from flask_sock import Sock
 
 from motor_control.farm_cleaner import Cleaner, map_pgm_to_png_bytes, make_snake, launch, stop, kill_all_zombies, S
 
-LOCATIONS_FILE = "/home/iedctly/ros2_ws/src/motor_control/config/locations.yaml"
-INSTALL_LOCATIONS_FILE = "/home/iedctly/ros2_ws/install/motor_control/share/motor_control/config/locations.yaml"
-SNAKE_WAYPOINTS_FILE = "/home/iedctly/ros2_ws/snake_waypoints.yaml"
+def robot_home() -> str:
+    return os.path.abspath(os.environ.get("ROBOT_HOME", os.path.expanduser("~")))
+
+
+LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/src/motor_control/config/locations.yaml")
+INSTALL_LOCATIONS_FILE = os.path.join(robot_home(), "ros2_ws/install/motor_control/share/motor_control/config/locations.yaml")
+SNAKE_WAYPOINTS_FILE = os.path.join(robot_home(), "ros2_ws/snake_waypoints.yaml")
 
 
 def _clamp(v, lo, hi):
@@ -200,6 +204,7 @@ class BridgeNode(Node):
         self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pub_initial_pose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.pub_hw_estop = self.create_publisher(EmptyMsg, '/estop', 10)
+        self.pub_estop_clear = self.create_publisher(EmptyMsg, '/estop_clear', 10)
         self.pub_turn_mode = self.create_publisher(Bool, '/single_side_turn', 10)
         self.single_side_turn = False
 
@@ -249,13 +254,6 @@ class BridgeNode(Node):
             threading.Thread(target=self.ensure_nav2_active, daemon=True).start()
         else:
             self.get_logger().info("[BridgeNode] No map file found on boot. System ready in IDLE mapping mode.")
-
-    def estop_guard_loop(self):
-        """Guard loop holding motors at 0 velocity when E-STOP active without flooding /estop."""
-        while rclpy.ok():
-            if self.status.get('e_stop', False):
-                self.publish_twist(0.0, 0.0)
-            time.sleep(0.5)
 
     def is_nav2_active(self) -> bool:
         """Check if Nav2 Action Servers are ready to accept goals."""
@@ -1144,6 +1142,13 @@ class BridgeNode(Node):
         if value:
             self.trigger_e_stop()
         else:
+            try:
+                empty_msg = EmptyMsg()
+                for _ in range(3):
+                    self.pub_estop_clear.publish(empty_msg)
+                    time.sleep(0.01)
+            except Exception as e:
+                self.get_logger().error(f"Error publishing /estop_clear: {e}")
             with self.lock:
                 self.status['e_stop'] = False
                 self.cancel_requested = False
@@ -1982,6 +1987,13 @@ def make_flask_app(node: BridgeNode) -> Flask:
     @app.route('/api/resume', methods=['POST'])
     def post_clear_estop():
         try:
+            try:
+                empty_msg = EmptyMsg()
+                for _ in range(3):
+                    node.pub_estop_clear.publish(empty_msg)
+                    time.sleep(0.01)
+            except Exception as e:
+                node.get_logger().error(f"Error publishing /estop_clear: {e}")
             with node.lock:
                 node.status['e_stop'] = False
                 node.cancel_requested = False
@@ -2102,7 +2114,6 @@ def main():
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=telemetry_loop, args=(node,), daemon=True).start()
-    threading.Thread(target=node.estop_guard_loop, daemon=True).start()
 
     executor = MultiThreadedExecutor()
     executor.add_node(node)
