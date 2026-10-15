@@ -280,7 +280,7 @@ def make_snake(map_yaml_file: str, bounds: list = None, row_gap: float = 0.4, st
                 c_idx = c_col + dc
                 if r_idx < 0 or r_idx >= height or c_idx < 0 or c_idx >= width:
                     return False
-                if grid[r_idx, c_idx] < 100:  # Obstacle threshold
+                if grid[r_idx, c_idx] < 250:  # Must be strictly free (grid >= 250); unknown (~205) is not free
                     return False
         return True
 

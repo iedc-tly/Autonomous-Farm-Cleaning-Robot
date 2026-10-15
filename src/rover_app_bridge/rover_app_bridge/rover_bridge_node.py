@@ -893,7 +893,7 @@ class BridgeNode(Node):
                         r_i, c_i = c_row + dr, c_col + dc
                         if r_i < 0 or r_i >= h or c_i < 0 or c_i >= w:
                             return False
-                        if grid[r_i, c_i] < 100:
+                        if grid[r_i, c_i] < 250:
                             return False
             return True
         except Exception as e:
