@@ -347,10 +347,11 @@ class BridgeNode(Node):
         return self.ensure_nav2_active()
 
 
-    def publish_initial_dock_pose(self):
+    def publish_initial_dock_pose(self, dock=None):
         """Publish initial pose estimation (dock position) to AMCL /initialpose and trigger stationary scan-sharpening."""
-        locs, _ = load_and_validate_locations()
-        dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        if dock is None:
+            locs, _ = load_and_validate_locations()
+            dock = locs['dock'] if locs else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
         if float(dock.get('x', 0.0)) < -1.35:
             self.get_logger().warn(f"[BridgeNode] Saved dock X={dock.get('x')} is outside current map. Falling back to map origin (0, 0, 0).")
             dock = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
@@ -479,7 +480,6 @@ class BridgeNode(Node):
                 'y': float(round(pose['y'], 3)),
                 'yaw': float(round(yaw, 3))
             }
-            self.publish_initial_dock_pose()
             saved_key = 'dock'
 
         elif loc_type_norm in ('pit', 'dump', 'waste', 'trash'):
@@ -512,6 +512,9 @@ class BridgeNode(Node):
         ok, save_err = save_locations_dict(locs)
         if not ok:
             return None, f"Failed to save locations.yaml: {save_err}"
+
+        if saved_key == 'dock':
+            self.publish_initial_dock_pose(dock=locs['dock'])
 
         self.get_logger().info(f"[BridgeNode] Saved current robot pose as '{saved_key}': {locs[saved_key if saved_key in ('dock', 'pit') else 'sweep']}")
         broadcast('/rover/locations', locs)
